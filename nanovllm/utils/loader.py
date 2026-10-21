@@ -19,6 +19,7 @@ def load_model(model: nn.Module, path: str):
                         v, shard_id = packed_modules_mapping[k]
                         param_name = weight_name.replace(k, v)
                         param = model.get_parameter(param_name)
+                        #调用nano_vllm model中实现好的weight_loader方法
                         weight_loader = getattr(param, "weight_loader")
                         weight_loader(param, f.get_tensor(weight_name), shard_id)
                         break

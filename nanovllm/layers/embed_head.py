@@ -18,6 +18,8 @@ class VocabParallelEmbedding(nn.Module):
         self.tp_size = dist.get_world_size()
         assert num_embeddings % self.tp_size == 0
         self.num_embeddings = num_embeddings
+        #tp，每个rank只存储1/tp_size的ebedding table
+        #开启权重共享对应最终输出的时候每个rank也只保存1/tp_size的weight
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
         self.vocab_start_idx = self.num_embeddings_per_partition * self.tp_rank
         self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition
@@ -33,11 +35,13 @@ class VocabParallelEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor):
         if self.tp_size > 1:
+            #mask在处理范围内才为True，即在处理范围内才处理
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
             x = mask * (x - self.vocab_start_idx)
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
+            #所有rank中的y相加
             dist.all_reduce(y)
         return y
 
@@ -58,9 +62,9 @@ class ParallelLMHead(VocabParallelEmbedding):
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
-        logits = F.linear(x, self.weight)
+        logits = F.linear(x, self.weight) # (batch_size, vocab_size // tp_size)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0)
-            logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
+            logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None # (batch_size, vocab_size)
         return logits

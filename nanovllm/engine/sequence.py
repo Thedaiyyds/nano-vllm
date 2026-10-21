@@ -22,9 +22,12 @@ class Sequence:
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
+        #与kvcache相关的由scheduler去控制
+        #已完成计算可以复用的block
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
         self.is_prefill = True
+        #当前请求的逻辑 Block 分别使用哪些物理 Block ID
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens

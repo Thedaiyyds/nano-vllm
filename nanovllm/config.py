@@ -15,6 +15,7 @@ class Config:
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
+    #warp up阶段才确定
     num_kvcache_blocks: int = -1
 
     def __post_init__(self):

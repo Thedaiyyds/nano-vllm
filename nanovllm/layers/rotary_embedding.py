@@ -8,6 +8,7 @@ def apply_rotary_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
+    #这里做rope的时候直接不是相邻两个元素为一组，而是前半部分对应位置和后半部分对应位置为一组
     x1, x2 = torch.chunk(x.float(), 2, dim=-1)
     y1 = x1 * cos - x2 * sin
     y2 = x2 * cos + x1 * sin
@@ -25,13 +26,16 @@ class RotaryEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         self.head_size = head_size
+        #这里rotary_dim其实就是head dim
         assert rotary_dim == head_size
         inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         t = torch.arange(max_position_embeddings, dtype=torch.float)
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        #生成不同位置不同组的旋转角度theha
+        freqs = torch.einsum("i,j -> ij", t, inv_freq) #（max_position_embeddings,rotary_dim）
         cos = freqs.cos()
         sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
+        #为之后的广播做处理,例如q的shape为(total_tokens, num_heads, head_dim)，这里为所有head广播
+        cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1) # (total_tokens, 1, head_dim // 2)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     @torch.compile
