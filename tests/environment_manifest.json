@@ -1,0 +1,54 @@
+{
+  "python": "3.12.15",
+  "packages": {
+    "torch": {
+      "version": "2.9.1+cu130",
+      "source": null
+    },
+    "torchvision": {
+      "version": "0.24.1+cu130",
+      "source": null
+    },
+    "triton": {
+      "version": "3.5.1",
+      "source": null
+    },
+    "flash-attn": {
+      "version": "2.8.3",
+      "source": {
+        "wheel_filename": "flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+      }
+    },
+    "transformers": {
+      "version": "5.21.0.dev0",
+      "source": {
+        "editable": true,
+        "repository": "huggingface/transformers",
+        "commit": "2711ad22c82105e240a2877b92d082fe2857936f"
+      }
+    },
+    "numpy": {
+      "version": "2.5.4",
+      "source": null
+    },
+    "pytest": {
+      "version": "8.4.2",
+      "source": null
+    },
+    "ruff": {
+      "version": "0.17.3",
+      "source": null
+    },
+    "iniconfig": {
+      "version": "2.3.1",
+      "source": null
+    },
+    "pluggy": {
+      "version": "1.7.0",
+      "source": null
+    }
+  },
+  "uv": "0.13.0",
+  "gpu_validation": "NOT RUN",
+  "scope": "Task 1a only; package metadata, not model validation"
+}

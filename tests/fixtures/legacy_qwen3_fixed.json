@@ -1,0 +1,81 @@
+{
+  "prompt_ids": [
+    9707,
+    11,
+    50493,
+    8273,
+    4086,
+    44,
+    13
+  ],
+  "seed": 2026,
+  "options": {
+    "enforce_eager": true,
+    "tensor_parallel_size": 1,
+    "max_model_len": 64,
+    "max_num_batched_tokens": 64,
+    "max_num_seqs": 1,
+    "gpu_memory_utilization": 0.2
+  },
+  "sampling": {
+    "temperature": 0.7,
+    "max_tokens": 8,
+    "ignore_eos": false
+  },
+  "model_files_sha256": {
+    "config.json": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd",
+    "tokenizer.json": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+    "tokenizer_config.json": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+  },
+  "token_ids": [
+    576,
+    3405,
+    374,
+    25,
+    304,
+    279,
+    4771,
+    11
+  ],
+  "text": " The question is: in the graph,",
+  "vocab_size": 151936,
+  "environment": {
+    "packages": {
+      "torch": {
+        "version": "2.9.1+cu130",
+        "source": null
+      },
+      "transformers": {
+        "version": "5.21.0.dev0",
+        "source": "{\"url\":\"file:///home/thedai/transformers\",\"dir_info\":{\"editable\":true}}",
+        "code_revision": "2711ad22c82105e240a2877b92d082fe2857936f",
+        "code_dirty_sha256": "ed1bdf64190488630314c96aac9154ab2fc059979cb71731dcfac6122184aa14"
+      },
+      "flash-attn": {
+        "version": "2.8.3",
+        "source": "{\"url\":\"file:///home/thedai/wheelhouse/flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl\",\"archive_info\":{}}"
+      },
+      "triton": {
+        "version": "3.5.1",
+        "source": null
+      },
+      "numpy": {
+        "version": "2.5.4",
+        "source": null
+      }
+    },
+    "cuda_runtime": "13.0",
+    "driver": "595.99.02",
+    "gpu": "NVIDIA GeForce RTX 5060 Ti",
+    "capability": [
+      12,
+      0
+    ],
+    "dtype": "bfloat16",
+    "compile": false,
+    "cuda_graph": false
+  },
+  "model_sha256": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b",
+  "source_root": "/tmp/qwen-legacy-original-41hoeqcm",
+  "source_revision": "bb823b3e06983d71485a8e1f23715ebd87d98ef8"
+}

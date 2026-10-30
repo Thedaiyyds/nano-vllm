@@ -25,3 +25,18 @@ Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nanovllm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+markers = [
+    "gpu: requires explicit --require-gpu and a real CUDA device",
+    "hf_reference: uses the pinned Hugging Face reference implementation",
+    "checkpoint: requires local model or reference artifacts",
+]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

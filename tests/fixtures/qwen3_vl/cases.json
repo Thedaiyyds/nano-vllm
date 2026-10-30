@@ -1,0 +1,12 @@
+{
+  "text_short": {"length": 24},
+  "text_255": {"length": 255},
+  "text_256": {"length": 256},
+  "text_257": {"length": 257},
+  "image_square": {"size": [256, 256], "color": [180, 40, 20]},
+  "image_rect": {"size": [384, 256], "color": [180, 40, 20]},
+  "image_same_layout_other_pixels": {"size": [256, 256], "color": [20, 40, 180]},
+  "image_limit": {"size": [512, 512], "color": [80, 120, 20]},
+  "image_candy": {"size": [256, 256], "file": "image/candy.JPG"},
+  "image_cat": {"size": [384, 256], "file": "image/哈基米.jpg"}
+}

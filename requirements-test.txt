@@ -1,0 +1,6 @@
+# Task 1a tooling, pinned from the reviewed uv dry-run.
+# Install only after approval, into the existing .venv with protected constraints.
+pytest==8.4.2
+ruff==0.17.3
+iniconfig==2.3.1
+pluggy==1.7.0

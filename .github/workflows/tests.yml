@@ -1,0 +1,31 @@
+name: CPU test infrastructure
+on:
+  pull_request:
+  push:
+permissions:
+  contents: read
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test tools in the isolated CI environment
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements-test.txt 'packaging==26.3' 'Pygments==2.21.0'
+      - name: Lint task files
+        run: |
+          .venv/bin/python -m ruff check tests nanovllm/__init__.py
+          .venv/bin/python -m ruff format --check tests nanovllm/__init__.py
+      - name: Fast CPU tests (GPU is not run)
+        run: |
+          .venv/bin/python -m pytest tests -m 'not gpu and not hf_reference and not checkpoint' -q --junitxml=cpu-junit.xml
+      - name: Upload CPU evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-test-results
+          path: cpu-junit.xml
