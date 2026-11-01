@@ -35,6 +35,16 @@ def test_sampling_params_does_not_import_gpu_extensions():
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_vl_config_tests_collect_without_model_stack():
+    result = run_import(
+        BLOCK_GPU_IMPORTS.replace(
+            "{'flash_attn', 'triton'}", "{'torch', 'transformers'}"
+        )
+        + "\nimport tests.test_qwen3_vl_config\n"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.hf_reference
 def test_config_does_not_import_gpu_extensions():
     result = run_import(

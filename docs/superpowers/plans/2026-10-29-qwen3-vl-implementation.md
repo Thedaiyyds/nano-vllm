@@ -10,7 +10,7 @@
 
 **Spec:** [已批准设计](../specs/2026-10-29-qwen3-vl-design.md)。执行者必须同时阅读两份文档。
 
-**Status:** 2026-10-29，第三版Review后四项小修订；Task1a/1b已验收；当前仅Native执行Task1c，技术交付及阈值提案完成后等待验收；Task2未授权。已执行范围以各任务记录为准；当前最多Task1c，Task2及以后仍为未来工作。当前分支 `feat/multimodal`，基线 `bb823b3`；保留全部已有未跟踪文件。
+**Status:** 2026-11-01，用户确认Task4已完成并授权Native Task5；本轮仅执行Task5，不推进Task6。HF Oracle使用持久化只读目录；宽BF16阈值仍未批准作为正确性自动放行标准。当前分支 `feat/multimodal`，HEAD `f331e43`；保留Task2–4未提交改动及全部已有未跟踪文件。历史报告中的旧授权状态仅记录当时边界。
 
 ## Global Constraints
 
@@ -23,7 +23,7 @@
 - 初期 VL 禁用 prefix cache 的查找和发布，保留语言 paged KV 读写；共享组件保留针对性兼容回归，原 Qwen3-0.6B 仅保留必要加载/生成smoke，不建立全模型数值基线。
 - `enforce_eager=True` 不会自动关闭 torch.compile；正确性基线额外使用 `TORCHDYNAMO_DISABLE=1`，编译优化另行验收。
 - 16GB 下 HF 与 nano-vLLM 分进程顺序运行，参考张量落 CPU；所有 GPU 测试串行执行。
-- 当前执行授权止于Native Task1c；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
+- 当前执行授权止于Native Task5；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
 
 ## Review Focus
 
@@ -114,7 +114,7 @@ uv用于指定解释器下的工具安装/包清单；测试用`.venv/bin/python
 
 ### 测试命令、TDD与证据
 
-以下为执行命令约定；当前执行范围止于Task1c，工具安装单独批准，Task2及以后命令不执行。仓库根目录：
+以下为执行命令约定；当前执行范围止于Task5，工具安装单独批准，Task6及以后命令不执行。仓库根目录：
 
 ```bash
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TORCHDYNAMO_DISABLE=1
@@ -147,7 +147,7 @@ GPU显式命令加`--require-gpu -m gpu`；此选项不是pytest内置选项，�
 
 ## Git工作流、里程碑Review与质量门禁
 
-当前按用户要求Native执行至Task1c；需要时隔离工作区，任务结束进行独立Review，禁止暂存/commit/push。每次开始开发先运行：
+当前按用户要求Native执行Task5；需要时隔离工作区，任务结束进行独立Review，禁止暂存/commit/push。每次开始开发先运行：
 
 ```bash
 git status --short --branch
@@ -239,7 +239,7 @@ self.assertTrue(all(0 <= t < config.hf_config.vocab_size for t in output['token_
 
 ### Task 1c：HF Oracle、kernel对照与阈值冻结
 
-**执行记录：** 参考采集/Kernel/校准提案已完成，待用户验收；见[Task1c报告](../../../tests/qwen3_vl_reference_results.md)。阈值仍为PROPOSED，未自动批准宽BF16包络或one-ULP floor，Task2未开始。
+**执行记录：** 用户已确认Task1c完成；见[Task1c报告](../../../tests/qwen3_vl_reference_results.md)及[持久化恢复记录](2026-10-30-qwen3-vl-oracle-recovery.md)。阈值仍为PROPOSED，未自动批准宽BF16包络或one-ULP floor。Task2授权独立于数值阈值批准。
 
 **前置依赖：** 1a测试基础就绪；数值部分依赖真实GPU可用。不依赖Qwen3-0.6B输出或数值基线，不依赖候选VL实现。1b兼容门槛独立记录。
 
@@ -261,13 +261,15 @@ self.assertEqual(manifest['model_revision'], '89644892e4d85e24eaac8bacfd4f463576
 
 ## Task 2：规范化 VL 配置及预算字段
 
+**执行记录：** 本轮实现、TDD、回归及独立Review见[Task2报告](2026-10-30-qwen3-vl-task2-results.md)。仅配置阶段，不表示M1文本推理或GPU数值验收完成。
+
 **前置依赖：** Task 1a 的 CPU 基础设施。
 
 **Files：** Modify `nanovllm/config.py:7` 的 Config；Create `tests/test_qwen3_vl_config.py`。
 
 **Interfaces：** Config 新增 `text_config`、`model_dtype: torch.dtype`、`is_multimodal: bool`、`eos_token_ids: frozenset[int]`、`max_visual_tokens: int=256`、`kv_cache_reserve_bytes: int=1073741824`。后者是计划采用的初始 1 GiB 安全余量，Task 13 实测不足则不能验收；原 Qwen3 不应用 VL 专用限制。`hf_config` 保留完整对象。
 
-- [ ] **1. 写 `ConfigTests.test_nested_config_and_limits`：** 本地 VL 配置 `text_config.hidden_size==2048`、`model_dtype==torch.bfloat16`、EOS 为 `{151645,151643}`；顶层 dtype 为 None 也成功；TP=2、VL CUDA Graph、非正预算、超出本期上限的配置明确 `ValueError`，未知 model_type 明确拒绝。原 Qwen3 配置仍可构造。
+- [x] **1. 写 `ConfigTests.test_nested_config_and_limits`：** 本地 VL 配置 `text_config.hidden_size==2048`、`model_dtype==torch.bfloat16`、EOS 为 `{151645,151643}`；顶层 dtype 为 None 也成功；TP=2、VL CUDA Graph、非正预算、超出本期上限的配置明确 `ValueError`，未知 model_type 明确拒绝。原 Qwen3 配置仍可构造。
 
 ```python
 self.assertEqual(config.text_config.hidden_size, 2048)
@@ -275,11 +277,13 @@ self.assertEqual(config.model_dtype, torch.bfloat16)
 self.assertEqual(config.eos_token_ids, frozenset({151645, 151643}))
 ```
 
-- [ ] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_config.py -m "not gpu" -q`，collection通过后，实际解析结果不符合nested config/dtype断言而失败。
-- [ ] **3. 实现解析。** `__post_init__` 中按 model_type 小分支解析文字字段/GenerationConfig，本期 VL 必须 BF16、`max_num_seqs=1`、`enforce_eager=True`；上限可降低，不默许扩大至未验收范围。明确错误信息包含字段和值；不修改全局默认 dtype。
-- [ ] **4. green/验收：** 同一CPU pytest命令通过；断言解析到 theta=5000000、sections=[24,20,20]。外层 max_model_len 与 checkpoint 能力取 min；原 Qwen3 配置回归通过。记录初始余量为工程参数，不宣称实机已测。
+- [x] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_config.py -m "not gpu" -q`，collection通过后失败。实际RED为生产解析访问错误的顶层字段，尚未到达nested数值断言；同时捕获不支持的model_type未拒绝。偏离原预期的具体失败形式见Task2报告。
+- [x] **3. 实现解析。** `__post_init__` 中按 model_type 小分支解析文字字段/GenerationConfig，本期 VL 必须 BF16、`max_num_seqs=1`、`enforce_eager=True`；上限可降低，不默许扩大至未验收范围。明确错误信息包含字段和值；不修改全局默认 dtype。
+- [x] **4. green/验收：** 同一CPU pytest命令通过；断言解析到 theta=5000000、sections=[24,20,20]。外层 max_model_len 与 checkpoint 能力取 min；原 Qwen3 配置回归通过。记录初始余量为工程参数，不宣称实机已测。
 
 ## Task 3：三轴位置与 Interleaved-MRoPE
+
+**执行记录：** 仅本任务的实现、TDD、CPU/真实GPU及独立Review见[Task3报告](2026-10-30-qwen3-vl-task3-results.md)。同设备HF组件采用有限值加逐元素精确相等检查，未采用未批准的宽BF16阈值；不表示引擎Decode接入或M1整体完成。
 
 **前置依赖：** Task 1c CPU oracle、Task 2。
 
@@ -287,7 +291,7 @@ self.assertEqual(config.eos_token_ids, frozenset({151645, 151643}))
 
 **Interfaces：** `build_mrope_positions(token_ids: list[int], mm_token_type_ids: Tensor, image_grid_thw: Tensor, spatial_merge_size: int) -> tuple[Tensor,int]` 输出 CPU int64 `[3,L]` 与 delta；纯文本用空 `[0,3]` grid。`Qwen3VLRotaryEmbedding(text_config).forward(positions: Tensor, q: Tensor, k: Tensor) -> tuple[Tensor,Tensor]` 消费 `[3,N]` 与 `[N,heads,head_dim]`。图像列表边界来自 grid；不在该数学函数内硬编码只准一图，入口限制由 Task 9 负责。
 
-- [ ] **1. 写 `MRopeTests.test_interleaved_axes` 和 `test_prompt_delta`。** 三轴不同的输入与固定 HF 比较；具体断言：half-dim 的 H 索引 `1:60:3`，W `2:60:3`，其余 T；纯文本 delta=0。合并后 2×3 图片网格、前2/后3文字 token 应得到 L=11、delta=-3；KV 长度仍为11。图片前后标签按实际 text token 计算。
+- [x] **1. 写 `MRopeTests.test_interleaved_axes` 和 `test_prompt_delta`。** 三轴不同的输入与固定 HF 比较；具体断言：half-dim 的 H 索引 `1:60:3`，W `2:60:3`，其余 T；纯文本 delta=0。合并后 2×3 图片网格、前2/后3文字 token 应得到 L=11、delta=-3；KV 长度仍为11。图片前后标签按实际 text token 计算。
 
 ```python
 positions, delta = build_mrope_positions(ids, types, torch.tensor([[1, 4, 6]]), 2)
@@ -296,11 +300,13 @@ self.assertEqual(delta, -3)
 self.assertTrue(torch.equal(positions, hf_positions))
 ```
 
-- [ ] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_mrope.py -m "not gpu" -q`，先通过collection，再由具体数值/状态断言失败构成red。
-- [ ] **3. 实现两个接口。** 位置按图文段顺序累计；频率 FP32 计算，cos/sin 转为 Q dtype 后按 HF 文字公式旋转。检查负维度、grid 消费不足/剩余和模态长度错配，不修改原一维 RotaryEmbedding。
-- [ ] **4. green/验收：** 所属CPU pytest模块通过；`.venv/bin/python -m pytest tests/test_qwen3_vl_mrope.py::MRopeGPUTests -m gpu --require-gpu -q` 检查 BF16 Q/K、非连续输入、首次 Decode `[L+delta]*3` 与连续步数。整数结果精确一致，浮点使用冻结组件阈值。
+- [x] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_mrope.py -m "not gpu" -q`，先通过collection，再由具体数值/状态断言失败构成red。
+- [x] **3. 实现两个接口。** 位置按图文段顺序累计；频率 FP32 计算，cos/sin 转为 Q dtype 后按 HF 文字公式旋转。检查负维度、grid 消费不足/剩余和模态长度错配，不修改原一维 RotaryEmbedding。
+- [x] **4. green/验收：** 所属CPU pytest模块通过；`.venv/bin/python -m pytest tests/test_qwen3_vl_mrope.py::MRopeGPUTests -m gpu --require-gpu -q` 检查 BF16 Q/K、非连续输入、首次 Decode `[L+delta]*3` 与连续步数。整数结果精确一致；当前同设备同dtype HF基础算子组件浮点采用更严格的有限值加精确相等，未使用未批准阈值，不推广到跨kernel或后续组件。
 
 ## Task 4：VL 权重映射与严格加载审计
+
+**执行记录：** 实现、TDD、625-key header审计、旧loader回归及独立Review修复见[Task4报告](2026-10-30-qwen3-vl-task4-results.md)。本任务不表示完整VL权重已经实载或M1整体完成。
 
 **前置依赖：** Task 1；测试用小模型不依赖完整 VL 构造。
 
@@ -308,7 +314,7 @@ self.assertTrue(torch.equal(positions, hf_positions))
 
 **Interfaces：** 保留 `load_model(model, path)` 原 Qwen3 接口。新增 `load_qwen3_vl_weights(model: nn.Module, path: str, *, text_only: bool=False) -> WeightLoadReport`；report 字段 `loaded_keys`、`skipped_keys`、`tied_aliases` 为字符串列表，失败抛含 missing/unexpected/shape/shard 信息的异常。
 
-- [ ] **1. 写 `LoaderTests.test_packed_shards_and_aliases`。** 用临时 safetensors 和小 nn.Module：缺少 K shard、重复映射、shape 错误、unexpected key 必须失败；vision `attn.qkv` 不被语言 packed 规则误伤；合法 tied embedding/head 只加载一次。text_only 仅允许跳过 `model.visual.`。
+- [x] **1. 写 `LoaderTests.test_packed_shards_and_aliases`。** 用临时 safetensors 和小 nn.Module：缺少 K shard、重复映射、shape 错误、unexpected key 必须失败；vision `attn.qkv` 不被语言 packed 规则误伤；合法 tied embedding/head 只加载一次。text_only 仅允许跳过 `model.visual.`。
 
 ```python
 with self.assertRaisesRegex(ValueError, "missing.*k_proj"):
@@ -316,11 +322,13 @@ with self.assertRaisesRegex(ValueError, "missing.*k_proj"):
 self.assertTrue(all(key.startswith("model.visual.") for key in report.skipped_keys))
 ```
 
-- [ ] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_loader.py -m "not gpu" -q`，接口可导入后，缺K shard未被拒绝或合法tied alias被拒绝的行为断言失败。
-- [ ] **3. 实现 loader/report。** 模型内部使用 checkpoint 命名空间 `model.language_model`/`model.visual`，仅语言 q/k/v、gate/up 做 packed 映射；按目标参数与每个 packed 子 shard 记录覆盖率，不能只计总 tensor 数。逐 tensor 加载释放，不缓存全量 state_dict。
-- [ ] **4. green/验收：** CPU pytest通过；实际 header 625 keys 全部有明确归属。Task 5/11 再用真实模型完成实载验收；此任务只声称映射/审计工具通过，不声称全模型已加载成功。原 Qwen3 loader 行为保持。
+- [x] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_loader.py -m "not gpu" -q`，接口可导入后，缺K shard未被拒绝或合法tied alias被拒绝的行为断言失败。
+- [x] **3. 实现 loader/report。** 模型内部使用 checkpoint 命名空间 `model.language_model`/`model.visual`，仅语言 q/k/v、gate/up 做 packed 映射；按目标参数与每个 packed 子 shard 记录覆盖率，不能只计总 tensor 数。逐 tensor 加载释放，不缓存全量 state_dict。
+- [x] **4. green/验收：** CPU pytest通过；实际 header 625 keys 全部有明确归属。Task 5/11 再用真实模型完成实载验收；此任务只声称映射/审计工具通过，不声称全模型已加载成功。原 Qwen3 loader 行为保持。
 
 ## Task 5：VL 文本 decoder 与 tied LM head
+
+**执行记录：** 文本实现、真实语言权重实载、TDD、CPU/GPU及独立Review见[Task5报告](2026-11-01-qwen3-vl-task5-results.md)。VL投影继承原packed参数/loader，分别执行Q/K/V、gate/up GEMM以对齐HF舍入顺序；原共享线性层不改。使用独立固定HF FlashAttention2 reference进行同后端零容差验收，旧SDPA Oracle仅诊断，未批准宽阈值未使用。性能影响留Benchmark，不表示Runner/Decode/视觉接通或M1整体完成。
 
 **前置依赖：** Tasks 2–4，GPU 部分依赖 Task 1c GPU 门槛。
 
@@ -328,7 +336,7 @@ self.assertTrue(all(key.startswith("model.visual.") for key in report.skipped_ke
 
 **Interfaces：** `Qwen3VLForConditionalGeneration(config, *, text_only: bool=True)`；内部 `model.language_model`，`lm_head` 与 embedding 绑定同一 Parameter。`forward(input_ids: Tensor, positions: Tensor, *, visual_features: tuple[Tensor,list[Tensor]]|None=None, visual_mask: Tensor|None=None) -> Tensor[N,2048]`；`compute_logits(hidden_states: Tensor) -> Tensor` 保持原末位置契约。此阶段 visual_features 非 None 显式报未接通，后续 Task 12 实现。
 
-- [ ] **1. 写 `TextTests.test_residual_order_and_tie`。** 单 rank 小配置验证 head 与 embedding 为同一 Parameter；固定输入先对齐单 decoder layer 的两个 residual/norm，再对齐整模型。额外构造可区分“延迟 residual”与“立即 BF16 add”的输入。
+- [x] **1. 写 `TextTests.test_residual_order_and_tie`。** 单 rank 小配置验证 head 与 embedding 为同一 Parameter；固定输入先对齐单 decoder layer 的两个 residual/norm，再对齐整模型。额外构造可区分“延迟 residual”与“立即 BF16 add”的输入。
 
 ```python
 self.assertIs(model.lm_head.weight, model.model.language_model.embed_tokens.weight)
@@ -336,9 +344,9 @@ assert_aligned("text_layer_0", actual_layer_0, hf_layer_0, tolerances)
 self.assertEqual(tuple(last_logits.shape), (1, 151936))
 ```
 
-- [ ] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_text.py -m gpu --require-gpu -q`，collection通过后，模型已可构造但显式residual顺序、tied Parameter或实际hidden/logits断言失败；缺模块先补最小可导入接口，不计red。
-- [ ] **3. 实现 VL text attention/MLP/decoder/wrapper。** 复用 QKVParallelLinear、MergedColumnParallelLinear、RowParallelLinear、RMSNorm 和 Attention；Q/K norm 后使用 Task 3，显式 `x = residual + attn`、`x = residual + mlp`，最终 norm。不复制修改原 Qwen3 decoder，也不误用其 fused add norm。
-- [ ] **4. green/验收：** GPU pytest通过 HF 单层及完整目标文本模型对照；实载报告只跳过视觉参数，无其他漏项。Prefill 最后 logits、选定层 hidden、各层旋转后 K/V 达到冻结阈值；语言用同一 checkpoint，不以 Qwen3-0.6B 代替。
+- [x] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_text.py -m gpu --require-gpu -q`，collection通过后，模型已可构造但显式residual顺序、tied Parameter或实际hidden/logits断言失败；缺模块先补最小可导入接口，不计red。
+- [x] **3. 实现 VL text attention/MLP/decoder/wrapper。** 复用 QKVParallelLinear、MergedColumnParallelLinear、RowParallelLinear、RMSNorm 和 Attention；Q/K norm 后使用 Task 3，显式 `x = residual + attn`、`x = residual + mlp`，最终 norm。不复制修改原 Qwen3 decoder，也不误用其 fused add norm。VL专用投影子类保留packed存储与加载，独立GEMM计算以保留HF舍入点；依据及性能成本见Task5报告。
+- [x] **4. green/验收：** GPU pytest通过 HF 单层及完整目标文本模型对照；实载报告只跳过视觉参数，无其他漏项。Prefill 最后 logits、选定层 hidden、各层旋转后 K/V 对固定独立HF FlashAttention2 reference有限值且精确相等。此同后端门槛不代表旧SDPA阈值获批或跨后端一致；语言用同一 checkpoint，不以 Qwen3-0.6B 代替。
 
 ## Task 6：确定性 greedy 与 VL 双 EOS
 
@@ -885,4 +893,4 @@ Review Focus五项均映射到测试；多图/视频/并发/TP不纳入实施范
 
 ## 审核交接
 
-此为第三版Review后的局部修订，当前Task1a/1b已验收，Task1c交付待验收；Task2尚未授权。请重点审查uv+pytest迁移方式、工具安装保护、旧功能兼容的收敛范围、同模型HF精度优先、Benchmark公平性、GPU证据和Commit批准边界。继续沿用Native；当前在Task1c交付真实测试/Diff/Review及阈值提案后停止，等待用户验收；不自动Commit/Push或推进Task2。
+历史第三版交接止于Task1c。2026-11-01用户确认Task4完成并授权Task5，本轮边界以顶部Status及Task5执行报告为准；阈值提案未因任务授权而获批准。不自动暂存/Commit/Push，不推进Task6。
