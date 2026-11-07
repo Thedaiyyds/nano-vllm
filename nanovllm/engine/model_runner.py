@@ -8,6 +8,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from nanovllm.layers.attention import Attention
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model, load_qwen3_vl_weights
@@ -160,8 +161,11 @@ class ModelRunner:
             self.config.max_num_batched_tokens,
             self.config.max_model_len,
         )
-        seq_len = min(max_num_batched_tokens, max_model_len)
-        num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
+        if self.config.is_multimodal:
+            seq_len, num_seqs = max_model_len, 1
+        else:
+            seq_len = min(max_num_batched_tokens, max_model_len)
+            num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
@@ -170,6 +174,9 @@ class ModelRunner:
 
     def allocate_kv_cache(self):
         config = self.config
+        if config.is_multimodal:
+            self._allocate_vl_kv_cache()
+            return
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
@@ -209,6 +216,47 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
+    def _allocate_vl_kv_cache(self):
+        config = self.config
+        text = config.text_config
+        attentions = [
+            m
+            for m in self.model.model.language_model.modules()
+            if isinstance(m, Attention)
+        ]
+        if len(attentions) != text.num_hidden_layers:
+            raise ValueError(
+                f"VL language Attention count {len(attentions)} != {text.num_hidden_layers}"
+            )
+        free, total = torch.cuda.mem_get_info()
+        stats = torch.cuda.memory_stats()
+        # Subtract the profile increment and explicit reserve once; the helper
+        # consumes this net budget, not the whole device's available memory.
+        available = (
+            int(
+                total * config.gpu_memory_utilization
+                - (total - free)
+                - stats["allocated_bytes.all.peak"]
+                + stats["allocated_bytes.all.current"]
+            )
+            - config.kv_cache_reserve_bytes
+        )
+        num_blocks = select_kv_block_count(config, max(available, 0))
+        self.kv_cache = torch.empty(
+            2,
+            text.num_hidden_layers,
+            num_blocks,
+            self.block_size,
+            text.num_key_value_heads,
+            text.head_dim,
+            dtype=config.model_dtype,
+            device="cuda",
+        )
+        config.num_kvcache_blocks = num_blocks
+        for i, attention in enumerate(attentions):
+            attention.k_cache = self.kv_cache[0, i]
+            attention.v_cache = self.kv_cache[1, i]
+
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [
@@ -220,6 +268,12 @@ class ModelRunner:
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
+        if self.config.is_multimodal:
+            if len(seqs) != 1 or any(
+                seq.num_cached_tokens != 0 or seq.num_scheduled_tokens != seq.num_tokens
+                for seq in seqs
+            ):
+                raise ValueError("VL Prefill requires one complete, uncached sequence")
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -262,6 +316,8 @@ class ModelRunner:
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
         )
+        if self.config.is_multimodal:
+            positions = positions.unsqueeze(0).expand(3, -1)
         cu_seqlens_q = torch.tensor(
             cu_seqlens_q, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)

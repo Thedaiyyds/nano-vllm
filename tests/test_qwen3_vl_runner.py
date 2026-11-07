@@ -1,4 +1,4 @@
-"""Task 8a CPU budget and model loading checks; no forward/Runner GPU claim."""
+"""Runner budgets/loading and explicit real-GPU full Prefill checks."""
 
 import os
 from pathlib import Path
@@ -323,3 +323,363 @@ class ModelSelectionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing.*q_proj"):
                 runner._load_model()
             self.assertEqual(torch.get_default_dtype(), before)
+
+
+EVIDENCE = (
+    Path(__file__).resolve().parents[1]
+    / ".superpowers/sdd/2026-10-29-qwen3-vl-implementation/task8b"
+)
+
+
+def prefill_config():
+    from nanovllm.config import Config
+
+    return Config(str(MODEL), max_num_seqs=1, enforce_eager=True)
+
+
+def tiny_cuda_runner(directory):
+    import torch
+    from nanovllm.engine.model_runner import ModelRunner
+    from nanovllm.layers.sampler import Sampler
+
+    config, _ = tiny_model_checkpoint(directory, multimodal=True)
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.config = config
+    runner.block_size = config.kvcache_block_size
+    runner.world_size = 1
+    runner.rank = 0
+    runner.sampler = Sampler()
+    with torch.device("cuda"):
+        runner._load_model()
+    return runner
+
+
+@pytest.mark.gpu
+class PrefillRunnerTests(unittest.TestCase):
+    def tearDown(self):
+        import torch
+        from nanovllm.utils.context import reset_context
+
+        reset_context()
+        torch.cuda.empty_cache()
+
+    def test_prefill_positions_and_noncontiguous_slots(self):
+        import torch
+        from nanovllm.engine.model_runner import ModelRunner
+        from nanovllm.engine.sequence import Sequence
+        from nanovllm.utils.context import get_context
+
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.config = prefill_config()
+        runner.block_size = 256
+        seq = Sequence([9707] * 257)
+        seq.num_scheduled_tokens = 257
+        seq.block_table = [2, 0]
+        ids, positions = runner.prepare_prefill([seq])
+        self.assertEqual(tuple(positions.shape), (3, 257))
+        self.assertTrue(torch.equal(positions.cpu(), torch.arange(257).expand(3, -1)))
+        self.assertEqual(ids.tolist(), [9707] * 257)
+        context = get_context()
+        want_slots = torch.cat((torch.arange(512, 768), torch.tensor([0]))).int()
+        self.assertTrue(torch.equal(context.slot_mapping.cpu(), want_slots))
+        self.assertEqual(context.cu_seqlens_q.tolist(), [0, 257])
+        self.assertEqual(context.cu_seqlens_k.tolist(), [0, 257])
+        self.assertEqual((context.max_seqlen_q, context.max_seqlen_k), (257, 257))
+        self.assertIsNone(context.block_tables)  # full Prefill uses direct Q/K/V
+
+    def test_rejects_partial_cached_or_batched_prefill(self):
+        from nanovllm.engine.model_runner import ModelRunner
+        from nanovllm.engine.sequence import Sequence
+        from nanovllm.utils.context import get_context
+
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.config = prefill_config()
+        runner.block_size = 256
+        for kind in ("partial", "cached", "batch"):
+            with self.subTest(kind=kind):
+                seq = Sequence([9707] * 4)
+                seq.num_scheduled_tokens = 4
+                seqs = [seq]
+                if kind == "partial":
+                    seq.num_scheduled_tokens = 2
+                elif kind == "cached":
+                    seq.num_cached_tokens = 1
+                    seq.num_scheduled_tokens = 3
+                else:
+                    seqs.append(seq)
+                before = get_context()
+                with self.assertRaisesRegex(ValueError, "VL.*[Pp]refill"):
+                    runner.prepare_prefill(seqs)
+                self.assertIs(get_context(), before)
+
+    @pytest.mark.usefixtures("model_loading_rank")
+    def test_language_only_binding_and_capacity_failure(self):
+        import tempfile
+        import torch
+        from torch import nn
+        from nanovllm.layers.attention import Attention
+
+        with tempfile.TemporaryDirectory() as directory:
+            runner = tiny_cuda_runner(Path(directory))
+        # A real decoy Attention outside language_model must never receive KV.
+        runner.model.model.visual = nn.Module()
+        decoy = runner.model.model.visual.attn = Attention(2, 128, 128**-0.5, 1)
+        decoy.k_cache = decoy.v_cache = torch.tensor([41.0], device="cuda")
+        original_decoy = decoy.k_cache
+        runner.allocate_kv_cache()
+        self.assertEqual(tuple(runner.kv_cache.shape), (2, 1, 1, 256, 1, 128))
+        self.assertEqual(runner.kv_cache.dtype, torch.bfloat16)
+        self.assertEqual(runner.kv_cache.device.type, "cuda")
+        self.assertEqual(runner.config.num_kvcache_blocks, 1)
+        attention = runner.model.model.language_model.layers[0].self_attn.attn
+        self.assertEqual(attention.k_cache.data_ptr(), runner.kv_cache[0, 0].data_ptr())
+        self.assertEqual(attention.v_cache.data_ptr(), runner.kv_cache[1, 0].data_ptr())
+        self.assertIs(decoy.k_cache, original_decoy)
+        self.assertEqual(decoy.k_cache.tolist(), [41.0])
+        original_pool = runner.kv_cache
+        reserve = runner.config.kv_cache_reserve_bytes
+        runner.config.kv_cache_reserve_bytes = torch.cuda.mem_get_info()[1]
+        try:
+            with self.assertRaisesRegex(ValueError, "KV budget"):
+                runner.allocate_kv_cache()
+            self.assertIs(runner.kv_cache, original_pool)
+            self.assertEqual(runner.config.num_kvcache_blocks, 1)
+        finally:
+            runner.config.kv_cache_reserve_bytes = reserve
+        runner.model.model.language_model.extra_attention = Attention(
+            2, 128, 128**-0.5, 1
+        )
+        with self.assertRaisesRegex(ValueError, "language Attention"):
+            runner.allocate_kv_cache()
+        self.assertIs(runner.kv_cache, original_pool)
+
+    @pytest.mark.usefixtures("model_loading_rank")
+    def test_warmup_profiles_full_context_despite_smaller_batch_budget(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            runner = tiny_cuda_runner(Path(directory))
+        runner.config.max_num_batched_tokens = 32
+        seen = []
+        original_run = runner.run
+
+        def observe(seqs, prefill):
+            seen.extend(seq.num_scheduled_tokens for seq in seqs)
+            return original_run(seqs, prefill)
+
+        runner.run = observe  # observe, then execute the actual model and kernels
+        runner.warmup_model()
+        self.assertEqual(seen, [64])
+
+    @pytest.mark.checkpoint
+    def test_target_checkpoint_prefill_and_physical_kv(self):
+        import json
+        import tempfile
+        import torch
+        from tests.reference_qwen3_vl import assert_aligned, tensor_metrics
+        from tests.support import run_worker
+        from tests.test_qwen3_vl_text import CASES, load_oracle
+
+        EVIDENCE.mkdir(parents=True, exist_ok=True)
+        directory = Path(tempfile.mkdtemp(prefix="prefill-", dir=EVIDENCE))
+        reference = run_worker(
+            "tests.test_qwen3_vl_text",
+            ["--full-worker", "hf", "--output", str(directory)],
+        )
+        (directory / "hf.log").write_text(reference.stdout + reference.stderr)
+        self.assertEqual(reference.returncode, 0, reference.stdout + reference.stderr)
+        native = run_worker(
+            "tests.test_qwen3_vl_runner", ["--prefill-worker", str(directory)]
+        )
+        (directory / "native.log").write_text(native.stdout + native.stderr)
+        report = json.loads((directory / "native-report.json").read_text())
+        self.assertEqual(
+            report["bound_attention_layers"], 28, native.stdout + native.stderr
+        )
+        self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
+        self.assertEqual(report["kv_shape"], [2, 28, 16, 256, 8, 128])
+        self.assertEqual(
+            report["warmup"], [{"tokens": 4096, "positions_shape": [3, 4096]}]
+        )
+        self.assertEqual((report["loaded_keys"], report["skipped_keys"]), (310, 315))
+        identity = json.loads((directory / "hf-identity.json").read_text())
+        self.assertEqual(identity["backend"], "flash_attention_2")
+        self.assertEqual(identity["gpu"], report["gpu"])
+        self.assertEqual(identity["dtype"], "torch.bfloat16")
+        self.assertEqual(
+            identity["allow_bf16_reduced_precision_reduction"],
+            report["allow_bf16_reduced_precision_reduction"],
+        )
+        metrics, failures = {}, []
+        for case in CASES:
+            actual = torch.load(
+                directory / f"runner-{case}.pt", map_location="cpu", weights_only=True
+            )
+            expected = torch.load(
+                directory / f"hf-{case}.pt", map_location="cpu", weights_only=True
+            )
+            oracle = load_oracle(case)
+            self.assertTrue(
+                torch.equal(actual.pop("input_ids"), oracle["input.input_ids"][0])
+            )
+            metrics[case] = {}
+            for name, value in actual.items():
+                limits = {name: {"max_abs": 0.0, "mean_abs": 0.0, "rel_l2": 0.0}}
+                if value.is_floating_point():
+                    metrics[case][name] = tensor_metrics(value, expected[name])
+                try:
+                    assert_aligned(name, value, expected[name], limits)
+                except AssertionError as error:
+                    failures.append(f"{case}: {error}")
+            self.assertTrue(report["cases"][case]["unused_page_nan"])
+        (directory / "comparison.json").write_text(
+            json.dumps(
+                {
+                    "metrics": metrics,
+                    "failures": failures,
+                    "standard": "finite + exact same-device/backend HF FA2; no wide BF16 thresholds",
+                },
+                indent=2,
+            )
+        )
+        self.assertFalse(
+            failures, f"{directory}: {failures[:8]} ({len(failures)} total)"
+        )
+
+
+def prefill_worker(directory):
+    """Real production Runner init, warmup, allocation and Prefill in one worker."""
+    import json
+    import traceback
+    import torch
+    import torch.distributed as dist
+    from nanovllm.engine.model_runner import ModelRunner
+    from nanovllm.engine.sequence import Sequence
+    from nanovllm.layers.attention import Attention
+    from nanovllm.sampling_params import SamplingParams
+    from nanovllm.utils.context import get_context, reset_context
+    from tests.test_qwen3_vl_text import CASES, load_oracle
+
+    config = prefill_config()
+    report = {"warmup": [], "cases": {}}
+
+    class ObservedRunner(ModelRunner):
+        def prepare_prefill(self, seqs):
+            ids, positions = super().prepare_prefill(seqs)
+            if not hasattr(self, "kv_cache"):
+                report["warmup"].append(
+                    {"tokens": len(ids), "positions_shape": list(positions.shape)}
+                )
+            return ids, positions
+
+        def allocate_kv_cache(self):
+            free, total = torch.cuda.mem_get_info()
+            stats = torch.cuda.memory_stats()
+            report["allocation_inputs"] = dict(
+                free=free,
+                total=total,
+                peak=stats["allocated_bytes.all.peak"],
+                current=stats["allocated_bytes.all.current"],
+                reserve=config.kv_cache_reserve_bytes,
+            )
+            return super().allocate_kv_cache()
+
+    runner = ObservedRunner.__new__(ObservedRunner)
+    previous_dtype = torch.get_default_dtype()
+    try:
+        runner.__init__(config, 0, [])
+        for case in CASES:
+            oracle = load_oracle(case)
+            seq = Sequence(
+                oracle["input.input_ids"][0].tolist(),
+                SamplingParams(temperature=0, max_tokens=1),
+            )
+            seq.num_scheduled_tokens = len(seq)
+            seq.block_table = [2] if len(seq) <= 256 else [2, 0]
+            runner.kv_cache.fill_(float("nan"))
+            ids, positions = runner.prepare_prefill([seq])
+            context = get_context()
+            slots = context.slot_mapping.long()
+            logical = torch.arange(len(seq), device="cuda")
+            pages = torch.tensor([2, 0], device="cuda")
+            assert torch.equal(slots, pages[logical // 256] * 256 + logical % 256)
+            torch.cuda.reset_peak_memory_stats()
+            with torch.inference_mode():
+                logits = runner.run_model(ids, positions, True)
+            peak, reserved = (
+                torch.cuda.max_memory_allocated(),
+                torch.cuda.max_memory_reserved(),
+            )
+            samples = oracle["prefill.kv.sample_positions"]
+            saved = {
+                "input_ids": ids.cpu(),
+                "positions": positions.cpu(),
+                "logits": logits.cpu(),
+                "kv.sample_positions": samples,
+            }
+            for i in range(28):
+                for kind, cache in (
+                    ("keys", runner.kv_cache[0, i]),
+                    ("values", runner.kv_cache[1, i]),
+                ):
+                    saved[f"kv.{i}.{kind}"] = cache.view(-1, 8, 128)[
+                        slots[samples.cuda()]
+                    ].cpu()
+            torch.save(saved, directory / f"runner-{case}.pt")
+            free, total = torch.cuda.mem_get_info()
+            report["cases"][case] = dict(
+                length=len(seq),
+                pages=seq.block_table,
+                slot_mapping=slots.cpu().tolist(),
+                peak_allocated_bytes=peak,
+                peak_reserved_bytes=reserved,
+                free_bytes=free,
+                total_bytes=total,
+                unused_page_nan=bool(torch.isnan(runner.kv_cache[:, :, 1]).all()),
+            )
+            reset_context()
+        report["loaded_keys"] = len(runner.weight_load_report.loaded_keys)
+        report["skipped_keys"] = len(runner.weight_load_report.skipped_keys)
+        report["status"] = "passed"
+    except Exception:
+        report["exception"] = traceback.format_exc()
+        raise
+    finally:
+        model = getattr(runner, "model", None)
+        report["bound_attention_layers"] = (
+            sum(
+                isinstance(m, Attention)
+                and m.k_cache.numel() > 0
+                and m.v_cache.numel() > 0
+                for m in model.modules()
+            )
+            if model is not None
+            else 0
+        )
+        report["kv_shape"] = (
+            list(runner.kv_cache.shape) if hasattr(runner, "kv_cache") else None
+        )
+        report.update(
+            gpu=torch.cuda.get_device_name(),
+            torch=torch.__version__,
+            cuda=torch.version.cuda,
+            allow_bf16_reduced_precision_reduction=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+        )
+        (directory / "native-report.json").write_text(json.dumps(report, indent=2))
+        # Worker teardown only; production failure recovery remains Task8c.
+        reset_context()
+        torch.set_default_device("cpu")
+        torch.set_default_dtype(previous_dtype)
+        if dist.is_initialized():
+            runner.exit()
+
+
+if __name__ == "__main__":
+    import argparse
+    import torch
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--prefill-worker", type=Path, required=True)
+    args = parser.parse_args()
+    torch.set_num_threads(1)
+    prefill_worker(args.prefill_worker)

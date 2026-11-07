@@ -10,7 +10,7 @@
 
 **Spec:** [已批准设计](../specs/2026-10-29-qwen3-vl-design.md)。执行者必须同时阅读两份文档。
 
-**Status:** 2026-11-07，Task2–5已作为阶段Commit `89c1e40`提交，Task6、Task7均已完成；用户授权Native Task8a；Task8a已完成且用户批准的一行环境指纹更新经正式GPU回归通过，唯一Important已关闭，本轮止于Task8a，不推进Task8b或自动提交。HF Oracle使用持久化只读目录；宽BF16阈值仍未批准作为正确性自动放行标准。当前分支 `feat/multimodal`，HEAD `89c1e40`；保留全部已有未跟踪实验文件。历史报告中的旧授权状态仅记录当时边界。
+**Status:** 2026-11-07，Task2–5提交为`89c1e40`，Task6、7、8a提交为`5912fcc`；用户授权的Native Task8b已完成完整Prefill与真实分页KV绑定；本轮止于8b，不推进8c、不自动暂存/Commit/Push。HF Oracle保持持久化只读，宽BF16阈值仍未批准作自动正确性标准。当前分支`feat/multimodal`，保留个人未跟踪实验。历史报告描述当时授权状态。
 
 ## Global Constraints
 
@@ -23,7 +23,7 @@
 - 初期 VL 禁用 prefix cache 的查找和发布，保留语言 paged KV 读写；共享组件保留针对性兼容回归，原 Qwen3-0.6B 仅保留必要加载/生成smoke，不建立全模型数值基线。
 - `enforce_eager=True` 不会自动关闭 torch.compile；正确性基线额外使用 `TORCHDYNAMO_DISABLE=1`，编译优化另行验收。
 - 16GB 下 HF 与 nano-vLLM 分进程顺序运行，参考张量落 CPU；所有 GPU 测试串行执行。
-- 当前执行授权止于Native Task8a；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
+- 当前执行授权止于Native Task8b；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
 
 ## Review Focus
 
@@ -451,8 +451,8 @@ self.assertEqual(select_kv_block_count(config, 16 * 29360128), 16)
 
 **Interfaces：** 消费VL text_only模型和三轴相同positions；产出最后logits及28层真实KV。
 
-- [ ] **1. Collection前置检查**：`.venv/bin/python -m pytest tests/test_qwen3_vl_runner.py --collect-only -q`，节点包含`PrefillRunnerTests`；缺模块先补可导入接口并重试，不计red。
-- [ ] **2. 行为red**：运行`.venv/bin/python -m pytest tests/test_qwen3_vl_runner.py::PrefillRunnerTests -m gpu --require-gpu -q`，测试断言：
+- [x] **1. Collection前置检查**：`.venv/bin/python -m pytest tests/test_qwen3_vl_runner.py --collect-only -q`，节点包含`PrefillRunnerTests`；缺模块先补可导入接口并重试，不计red。
+- [x] **2. 行为red**：运行`.venv/bin/python -m pytest tests/test_qwen3_vl_runner.py::PrefillRunnerTests -m gpu --require-gpu -q`，测试断言：
 
 ```python
 self.assertEqual(bound_attention_layers, 28)
@@ -460,8 +460,10 @@ assert_aligned("text_prefill_logits", actual_logits, hf_logits, tolerances)
 ```
 
 记录到达的断言和不匹配值；不是setup/import错误。
-- [ ] **3. 最小实现**：绑定仅语言Attention；验证非连续slot/block table；新增测试使用现有源码实际Attention/store内核。
-- [ ] **4. Green/完成条件**：重跑上述命令并跑本父任务已完成子模块回归；短prompt和255/256/257 Prefill logits与选定KV达到HF阈值。保存JUnit/数值报告，进入所属里程碑质量门禁，不自动commit。
+- [x] **3. 最小实现**：绑定仅语言Attention；验证非连续slot/block table；新增测试使用现有源码实际Attention/store内核。
+- [x] **4. Green/完成条件**：重跑上述命令并跑本父任务已完成子模块回归；短prompt和255/256/257 Prefill logits与选定KV达到HF阈值。保存JUnit/数值报告，进入所属里程碑质量门禁，不自动commit。
+
+**2026-11-07 执行结果：** Task8b验收完成。真实Runner4096完整warmup、28层语言KV绑定、16块BF16池；24/255/256/257每例57浮点组件与独立HF FA2精确相等，未使用宽BF16阈值。CPU183通过，快速31通过；独立Review无阻塞项。中断前组合曾因HF worker超时及旧模型容量断言3失败，日志保留；恢复后不改代码/基准/断言/超时，同一正式GPU组合7项通过、FAILED/ERROR/SKIPPED均0（26.98s）。原失败历史资源原因未能确定，不冒称生产修复。详见[Task8b报告](2026-11-07-qwen3-vl-task8b-results.md)。不开始8c，不暂存/Commit/Push。
 
 ### Task 8c：纯文本Decode与Runner初始化收尾
 
