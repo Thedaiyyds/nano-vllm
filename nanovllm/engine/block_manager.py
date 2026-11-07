@@ -6,7 +6,6 @@ from nanovllm.engine.sequence import Sequence
 
 
 class Block:
-
     def __init__(self, block_id):
         self.block_id = block_id
         self.ref_count = 0
@@ -24,9 +23,11 @@ class Block:
 
 
 class BlockManager:
-
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(
+        self, num_blocks: int, block_size: int, *, enable_prefix_cache: bool = True
+    ):
         self.block_size = block_size
+        self.enable_prefix_cache = enable_prefix_cache
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
@@ -56,6 +57,8 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
+        if not self.enable_prefix_cache:
+            return 0 if len(self.free_block_ids) >= seq.num_blocks else -1
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
@@ -74,6 +77,7 @@ class BlockManager:
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table
+        assert self.enable_prefix_cache or num_cached_blocks == 0
         h = -1
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
@@ -108,9 +112,12 @@ class BlockManager:
             seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence):
+        if not self.enable_prefix_cache:
+            return
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
-        if start == end: return
+        if start == end:
+            return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]

@@ -6,13 +6,22 @@ from nanovllm.engine.block_manager import BlockManager
 
 
 class Scheduler:
-
     def __init__(self, config: Config):
+        self.is_multimodal = getattr(config, "is_multimodal", False)
+        if self.is_multimodal:
+            self.max_model_len = config.max_model_len
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
+        self.eos_token_ids = (
+            config.eos_token_ids if self.is_multimodal else frozenset({self.eos})
+        )
         self.block_size = config.kvcache_block_size
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.block_manager = BlockManager(
+            config.num_kvcache_blocks,
+            config.kvcache_block_size,
+            enable_prefix_cache=not self.is_multimodal,
+        )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -20,9 +29,54 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        if self.is_multimodal:
+            total_tokens = seq.num_tokens + seq.max_tokens
+            if total_tokens > self.max_model_len:
+                raise ValueError("VL prompt + max_tokens exceeds max_model_len")
+            if seq.num_tokens > self.max_num_batched_tokens:
+                raise ValueError("VL full prefill exceeds max_num_batched_tokens")
+            required_blocks = (total_tokens + self.block_size - 1) // self.block_size
+            if required_blocks > len(self.block_manager.blocks):
+                raise ValueError("VL request exceeds total KV block capacity")
         self.waiting.append(seq)
 
+    def abort(self, seq: Sequence) -> None:
+        for queue in (self.waiting, self.running):
+            if seq in queue:
+                queue.remove(seq)
+        self.block_manager.deallocate(seq)
+        seq.num_scheduled_tokens = 0
+        seq.status = SequenceStatus.FINISHED
+
+    def _schedule_multimodal(self) -> tuple[list[Sequence], bool]:
+        if self.running:
+            seq = self.running[0]
+            if not self.block_manager.can_append(seq):
+                raise RuntimeError(
+                    "VL KV capacity invariant violated during decode; abort request"
+                )
+            self.block_manager.may_append(seq)
+            seq.num_scheduled_tokens = 1
+            seq.is_prefill = False
+            return [seq], False
+
+        seq = self.waiting[0]
+        total_tokens = seq.num_tokens + seq.max_tokens
+        required_blocks = (total_tokens + self.block_size - 1) // self.block_size
+        if required_blocks > len(self.block_manager.free_block_ids):
+            raise RuntimeError(
+                "VL KV capacity invariant violated before prefill; abort request"
+            )
+        self.block_manager.allocate(seq, 0)
+        seq.num_scheduled_tokens = seq.num_tokens
+        seq.status = SequenceStatus.RUNNING
+        self.waiting.popleft()
+        self.running.append(seq)
+        return [seq], True
+
     def schedule(self) -> tuple[list[Sequence], bool]:
+        if self.is_multimodal:
+            return self._schedule_multimodal()
         scheduled_seqs = []
         num_batched_tokens = 0
 
@@ -39,7 +93,9 @@ class Scheduler:
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
+            if (
+                remaining < num_tokens and scheduled_seqs
+            ):  # only allow chunked prefill for the first seq
                 break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
@@ -86,7 +142,9 @@ class Scheduler:
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            if (
+                not seq.ignore_eos and token_id in self.eos_token_ids
+            ) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from math import isfinite
 
 
 @dataclass(slots=True)
@@ -8,4 +9,11 @@ class SamplingParams:
     ignore_eos: bool = False
 
     def __post_init__(self):
-        assert self.temperature > 1e-10, "greedy sampling is not permitted"
+        if not isfinite(self.temperature) or self.temperature < 0:
+            raise ValueError(
+                f"temperature={self.temperature!r} must be finite and nonnegative"
+            )
+        if type(self.max_tokens) is not int or self.max_tokens <= 0:
+            raise ValueError(
+                f"max_tokens={self.max_tokens!r} must be a positive integer"
+            )

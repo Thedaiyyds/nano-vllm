@@ -10,7 +10,7 @@
 
 **Spec:** [已批准设计](../specs/2026-10-29-qwen3-vl-design.md)。执行者必须同时阅读两份文档。
 
-**Status:** 2026-11-01，用户确认Task4已完成并授权Native Task5；本轮仅执行Task5，不推进Task6。HF Oracle使用持久化只读目录；宽BF16阈值仍未批准作为正确性自动放行标准。当前分支 `feat/multimodal`，HEAD `f331e43`；保留Task2–4未提交改动及全部已有未跟踪文件。历史报告中的旧授权状态仅记录当时边界。
+**Status:** 2026-11-07，Task2–5已作为阶段Commit `89c1e40`提交，Task6、Task7均已完成；用户授权Native Task8a；Task8a已完成且用户批准的一行环境指纹更新经正式GPU回归通过，唯一Important已关闭，本轮止于Task8a，不推进Task8b或自动提交。HF Oracle使用持久化只读目录；宽BF16阈值仍未批准作为正确性自动放行标准。当前分支 `feat/multimodal`，HEAD `89c1e40`；保留全部已有未跟踪实验文件。历史报告中的旧授权状态仅记录当时边界。
 
 ## Global Constraints
 
@@ -23,7 +23,7 @@
 - 初期 VL 禁用 prefix cache 的查找和发布，保留语言 paged KV 读写；共享组件保留针对性兼容回归，原 Qwen3-0.6B 仅保留必要加载/生成smoke，不建立全模型数值基线。
 - `enforce_eager=True` 不会自动关闭 torch.compile；正确性基线额外使用 `TORCHDYNAMO_DISABLE=1`，编译优化另行验收。
 - 16GB 下 HF 与 nano-vLLM 分进程顺序运行，参考张量落 CPU；所有 GPU 测试串行执行。
-- 当前执行授权止于Native Task5；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
+- 当前执行授权止于Native Task8a；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
 
 ## Review Focus
 
@@ -114,7 +114,7 @@ uv用于指定解释器下的工具安装/包清单；测试用`.venv/bin/python
 
 ### 测试命令、TDD与证据
 
-以下为执行命令约定；当前执行范围止于Task5，工具安装单独批准，Task6及以后命令不执行。仓库根目录：
+以下为执行命令约定；当前执行范围止于Task6，工具安装单独批准，Task7及以后命令不执行。仓库根目录：
 
 ```bash
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TORCHDYNAMO_DISABLE=1
@@ -147,7 +147,7 @@ GPU显式命令加`--require-gpu -m gpu`；此选项不是pytest内置选项，�
 
 ## Git工作流、里程碑Review与质量门禁
 
-当前按用户要求Native执行Task5；需要时隔离工作区，任务结束进行独立Review，禁止暂存/commit/push。每次开始开发先运行：
+当前按用户要求Native执行Task6；需要时隔离工作区，任务结束进行独立Review，禁止暂存/commit/push。每次开始开发先运行：
 
 ```bash
 git status --short --branch
@@ -350,13 +350,15 @@ self.assertEqual(tuple(last_logits.shape), (1, 151936))
 
 ## Task 6：确定性 greedy 与 VL 双 EOS
 
+**执行记录：** 从中断继续完成；实现、TDD、CPU/真实GPU及独立Review见[Task6报告](2026-11-02-qwen3-vl-task6-results.md)。本任务只处理采样/EOS语义，不表示完整VL Runner或生成链路接通。Review无Critical/Important，1项非阻塞正温度测试覆盖增强建议记录为延期Minor。
+
 **前置依赖：** Task 2；GPU sampling 对照依赖 Task 1。
 
 **Files：** Modify `nanovllm/sampling_params.py:5`、`nanovllm/layers/sampler.py:5`、`nanovllm/engine/scheduler.py:10,81`、`nanovllm/engine/llm_engine.py:32`；Create `tests/test_qwen3_vl_sampling.py`。
 
 **Interfaces：** `SamplingParams(temperature=0.0, max_tokens=...)` 表示 greedy；Sampler.forward 签名不变。Scheduler 的结束条件使用 Config.eos_token_ids（VL）或原 eos（Qwen3），正温度原算法保留。
 
-- [ ] **1. 写 `SamplingTests.test_zero_temperature_and_eos`：** logits `[1,3,2]` 在 temperature=0 恒返回1；同分数取 argmax 首项；负温度/非正 max_tokens 报错。两个 EOS 分别结束，ignore_eos 忽略两个，max_tokens=1 仍在首个生成 token 后结束。
+- [x] **1. 写 `SamplingTests.test_zero_temperature_and_eos`：** logits `[1,3,2]` 在 temperature=0 恒返回1；同分数取 argmax 首项；负温度/非正 max_tokens 报错。两个 EOS 分别结束，ignore_eos 忽略两个，max_tokens=1 仍在首个生成 token 后结束。
 
 ```python
 sp = SamplingParams(temperature=0.0, max_tokens=1)
@@ -366,9 +368,9 @@ scheduler.postprocess([seq], [151643], True)
 self.assertTrue(seq.is_finished)
 ```
 
-- [ ] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_sampling.py -m "not gpu" -q`，collection通过后，合法temperature=0被错误拒绝而行为断言失败。
-- [ ] **3. 实现 greedy mask 分支和 EOS 集合。** 不对零温度行做除法，不用极小温度近似；LLMEngine 不用 tokenizer 单 EOS 覆盖 VL generation_config 的集合。拒绝 NaN/Inf temperature。
-- [ ] **4. green/验收：** 所属CPU pytest模块和 `.venv/bin/python -m pytest tests/test_qwen3_vl_sampling.py::SamplingGPUTests -m gpu --require-gpu -q` 通过；全正温度批次固定 seed 与原实现结果一致；混合零/正温度行各自合法且无除零。无新增 top-k/top-p 功能。
+- [x] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_sampling.py -m "not gpu" -q`，collection通过后，合法temperature=0被错误拒绝而行为断言失败。
+- [x] **3. 实现 greedy mask 分支和 EOS 集合。** 不对零温度行做除法，不用极小温度近似；LLMEngine 不用 tokenizer 单 EOS 覆盖 VL generation_config 的集合。拒绝 NaN/Inf temperature。
+- [x] **4. green/验收：** 所属CPU pytest模块和 `.venv/bin/python -m pytest tests/test_qwen3_vl_sampling.py::SamplingGPUTests -m gpu --require-gpu -q` 通过；全正温度批次固定 seed 与原实现结果一致；混合零/正温度行各自合法且无除零。无新增 top-k/top-p 功能。
 
 ## Task 7：单活动请求、容量准入与 prefix cache 隔离
 
@@ -378,7 +380,7 @@ self.assertTrue(seq.is_finished)
 
 **Interfaces：** `BlockManager(num_blocks, block_size, *, enable_prefix_cache: bool=True)`；关闭时查找与 hash 发布均停用，其他接口不变。`Scheduler.abort(seq: Sequence) -> None` 从队列移除、释放该 seq 块、置 FINISHED；重复 abort 安全。`Scheduler.add` 在 VL 分支校验预算。
 
-- [ ] **1. 写 `SchedulerTests.test_serial_admission_and_capacity`。** 两个等待请求：第二个在第一个 Decode/完成前不得占块；第一个 Prefill 必须调度全 L。`ceil((L+max_tokens)/256)` 超池或超长度、L 超 max_num_batched_tokens 均报错且 free/used/ref_count 不变；不能死循环。`test_no_prefix_lookup_or_publish` 用相同长 token IDs 连续两请求，断言 cached_tokens=0、hash map 为空。
+- [x] **1. 写 `SchedulerTests.test_serial_admission_and_capacity`。** 两个等待请求：第二个在第一个 Decode/完成前不得占块；第一个 Prefill 必须调度全 L。`ceil((L+max_tokens)/256)` 超池或超长度、L 超 max_num_batched_tokens 均报错且 free/used/ref_count 不变；不能死循环。`test_no_prefix_lookup_or_publish` 用相同长 token IDs 连续两请求，断言 cached_tokens=0、hash map 为空。
 
 ```python
 scheduled, is_prefill = scheduler.schedule()  # 第一个请求已完成 Prefill，第二个仍等待。
@@ -388,9 +390,12 @@ self.assertEqual(second.block_table, [])
 self.assertEqual(scheduler.block_manager.hash_to_block_id, {})
 ```
 
-- [ ] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_scheduler.py -m "not gpu" -q`，现有 waiting 优先策略应暴露问题。
-- [ ] **3. 实现 VL 小分支。** add 时以池总块数判断请求是否最终可容纳，不能因为前一请求暂占块就拒绝合法排队；真正准入时检查可用块数。有 running 就 Decode，不准入 waiting；仅一个请求时根据完整未来长度证明追加容量，仍按需分配块。不进入抢占分支；不可能追加时抛清晰 invariant 错误并由上层 abort。原 Qwen3 仍走原 chunk/prefix/preempt 路径。
-- [ ] **4. green/验收：** CPU pytest通过含 255/256/257、连续排队与重复 abort；加原 Qwen3 prefix hit、chunked prefill、抢占状态的 CPU 回归。断言所有完成/异常请求 ref_count 归零，空队列 is_finished=True。
+- [x] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_scheduler.py -m "not gpu" -q`，现有 waiting 优先策略应暴露问题。
+- [x] **3. 实现 VL 小分支。** add 时以池总块数判断请求是否最终可容纳，不能因为前一请求暂占块就拒绝合法排队；真正准入时检查可用块数。有 running 就 Decode，不准入 waiting；仅一个请求时根据完整未来长度证明追加容量，仍按需分配块。不进入抢占分支；不可能追加时抛清晰 invariant 错误并由上层 abort。原 Qwen3 仍走原 chunk/prefix/preempt 路径。
+- [x] **4. green/验收：** CPU pytest通过含 255/256/257、连续排队与重复 abort；加原 Qwen3 prefix hit、chunked prefill、抢占状态的 CPU 回归。断言所有完成/异常请求 ref_count 归零，空队列 is_finished=True。
+
+
+**2026-11-02 执行结果：** Task7完成；CPU17/17，完整CPU160通过、15未选，旧Qwen3真实GPU2通过、9未选，最终FAILED/ERROR/SKIPPED均0。独立Review无未解决Critical/Important、无新增Minor；最小CI导入问题已修复。未暂存/提交/推送，止于Task7；详见[Task7报告](2026-11-02-qwen3-vl-task7-results.md)。
 
 ## Task 8：Runner 接通纯文本与真实 paged KV
 
@@ -424,8 +429,8 @@ with self.assertRaises(ValueError):
 
 **Interfaces：** 消费Config；产出父节kv_block_bytes/select_kv_block_count；available_bytes为扣除余量后的净预算。
 
-- [ ] **1. Collection前置检查**：`.venv/bin/python -m pytest tests/test_qwen3_vl_runner.py --collect-only -q`，节点包含`BudgetTests`；缺模块先补可导入接口并重试，不计red。
-- [ ] **2. 行为red**：运行`.venv/bin/python -m pytest tests/test_qwen3_vl_runner.py::BudgetTests -m "not gpu" -q`，测试断言：
+- [x] **1. Collection前置检查**：`.venv/bin/python -m pytest tests/test_qwen3_vl_runner.py --collect-only -q`，节点包含`BudgetTests`；缺模块先补可导入接口并重试，不计red。
+- [x] **2. 行为red**：运行`.venv/bin/python -m pytest tests/test_qwen3_vl_runner.py::BudgetTests -m "not gpu" -q`，测试断言：
 
 ```python
 self.assertEqual(kv_block_bytes(config.text_config, 256, torch.bfloat16), 29360128)
@@ -433,8 +438,10 @@ self.assertEqual(select_kv_block_count(config, 16 * 29360128), 16)
 ```
 
 记录到达的断言和不匹配值；不是setup/import错误。
-- [ ] **3. 最小实现**：nested dtype和model_type分支；预算不足直接ValueError；明确16只对应max_model_len4096/block256，不硬编码通用16。
-- [ ] **4. Green/完成条件**：重跑上述命令并跑本父任务已完成子模块回归；CPU预算/异常边界断言全过，原Qwen3分支保留。保存JUnit/数值报告，进入所属里程碑质量门禁，不自动commit。
+- [x] **3. 最小实现**：nested dtype和model_type分支；预算不足直接ValueError；明确16只对应max_model_len4096/block256，不硬编码通用16。
+- [x] **4. Green/完成条件**：重跑上述命令并跑本父任务已完成子模块回归；CPU预算/异常边界断言全过，原Qwen3分支保留。保存JUnit/数值报告，进入所属里程碑质量门禁，不自动commit。
+
+**2026-11-07 最终状态：** Task8a验收完成。本任务CPU23项通过；用户明确批准正式fixture仅一行Transformers注释指纹更新，原始失败和基准证据保留；正式旧模型GPU2项全通过（12.27s），更新后完整CPU183项通过（10.42s），FAILED/ERROR/SKIPPED均0。Review原唯一Important由该授权更新和正式回归关闭，原始With fixes结论保留；无代码修复或第二次Review。未修改token、数值阈值或断言。详见[Task8a报告](2026-11-07-qwen3-vl-task8a-results.md)。止于8a，不开始8b，不暂存/提交/推送。
 
 ### Task 8b：纯文本完整Prefill与分页KV绑定
 
@@ -893,4 +900,4 @@ Review Focus五项均映射到测试；多图/视频/并发/TP不纳入实施范
 
 ## 审核交接
 
-历史第三版交接止于Task1c。2026-11-01用户确认Task4完成并授权Task5，本轮边界以顶部Status及Task5执行报告为准；阈值提案未因任务授权而获批准。不自动暂存/Commit/Push，不推进Task6。
+历史第三版交接止于Task1c。Task2–5现已提交为`89c1e40`，当前用户授权Task6，本轮边界以顶部Status及Task6执行报告为准；阈值提案未因任务授权而获批准。不自动暂存/Commit/Push，不推进Task7。

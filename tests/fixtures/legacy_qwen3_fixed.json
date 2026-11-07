@@ -49,7 +49,7 @@
         "version": "5.21.0.dev0",
         "source": "{\"url\":\"file:///home/thedai/transformers\",\"dir_info\":{\"editable\":true}}",
         "code_revision": "2711ad22c82105e240a2877b92d082fe2857936f",
-        "code_dirty_sha256": "ed1bdf64190488630314c96aac9154ab2fc059979cb71731dcfac6122184aa14"
+        "code_dirty_sha256": "ac1ed6c4cc6c3b461fce22df7132bb1d0af4a4345ecb3135d1bb76512d334542"
       },
       "flash-attn": {
         "version": "2.8.3",
