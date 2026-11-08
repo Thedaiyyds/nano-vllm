@@ -1,3 +1,4 @@
+import gc
 import pickle
 import torch
 import torch.distributed as dist
@@ -87,42 +88,86 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-
-        dist.init_process_group(
-            "nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank
-        )
-        torch.cuda.set_device(rank)
+        self._closed = False
+        self._owns_process_group = False
+        self._device_set = False
+        self._initialized = False
         default_dtype = torch.get_default_dtype()
-        torch.set_default_device("cuda")
-        self._load_model()
-        torch.set_default_dtype(config.model_dtype)
-        self.sampler = Sampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
-        torch.set_default_device("cpu")
-        torch.set_default_dtype(default_dtype)
+        default_device = torch.get_default_device()
+        try:
+            try:
+                dist.init_process_group(
+                    "nccl",
+                    "tcp://localhost:2333",
+                    world_size=self.world_size,
+                    rank=rank,
+                )
+                self._owns_process_group = True
+                torch.cuda.set_device(rank)
+                self._device_set = True
+                torch.set_default_device("cuda")
+                self._load_model()
+                torch.set_default_dtype(config.model_dtype)
+                self.sampler = Sampler()
+                self.warmup_model()
+                self.allocate_kv_cache()
+                if not self.enforce_eager:
+                    self.capture_cudagraph()
+            finally:
+                torch.set_default_device(default_device)
+                torch.set_default_dtype(default_dtype)
 
-        if self.world_size > 1:
-            if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-                dist.barrier()
-            else:
-                dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
+            if self.world_size > 1:
+                if rank == 0:
+                    self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                    dist.barrier()
+                else:
+                    dist.barrier()
+                    self.shm = SharedMemory(name="nanovllm")
+            self._initialized = True
+            if self.world_size > 1 and rank > 0:
                 self.loop()
+        except Exception as error:
+            try:
+                self.exit()
+            except Exception as cleanup_error:
+                raise error from cleanup_error
+            raise
 
     def exit(self):
-        if self.world_size > 1:
-            self.shm.close()
-            dist.barrier()
-            if self.rank == 0:
-                self.shm.unlink()
-        if not self.enforce_eager:
-            del self.graphs, self.graph_pool
-        torch.cuda.synchronize()
-        dist.destroy_process_group()
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        try:
+            if hasattr(self, "shm"):
+                self.shm.close()
+                if self._initialized:
+                    dist.barrier()
+                if self.rank == 0:
+                    self.shm.unlink()
+            if self._device_set:
+                torch.cuda.synchronize()
+        finally:
+            reset_context()
+            for name in (
+                "model",
+                "kv_cache",
+                "sampler",
+                "graphs",
+                "graph_pool",
+                "graph_vars",
+                "shm",
+            ):
+                self.__dict__.pop(name, None)
+            try:
+                if self._owns_process_group and dist.is_initialized():
+                    dist.destroy_process_group()
+            finally:
+                self._owns_process_group = False
+                if self._device_set:
+                    # Parameters' bound weight_loader methods form module cycles.
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
     def loop(self):
         while True:
@@ -340,6 +385,8 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        if self.config.is_multimodal and len(seqs) != 1:
+            raise ValueError("VL Decode requires one active sequence")
         input_ids = []
         positions = []
         slot_mapping = []
@@ -357,6 +404,8 @@ class ModelRunner:
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
         )
+        if self.config.is_multimodal:
+            positions = positions.unsqueeze(0).expand(3, -1)
         slot_mapping = torch.tensor(
             slot_mapping, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
@@ -403,16 +452,17 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = (
-            self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        )
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = (
-            self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        )
-        reset_context()
-        return token_ids
+        try:
+            input_ids, positions = (
+                self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+            )
+            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+            logits = self.run_model(input_ids, positions, is_prefill)
+            return (
+                self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            )
+        finally:
+            reset_context()
 
     @torch.inference_mode()
     def capture_cudagraph(self):

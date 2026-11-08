@@ -20,25 +20,50 @@ class LLMEngine:
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
-        ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
-            self.ps.append(process)
-            self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        if not config.is_multimodal:
-            config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config)
-        atexit.register(self.exit)
+        self.model_runner = None
+        self._closed = False
+        try:
+            ctx = mp.get_context("spawn")
+            for i in range(1, config.tensor_parallel_size):
+                event = ctx.Event()
+                process = ctx.Process(target=ModelRunner, args=(config, i, event))
+                process.start()
+                self.ps.append(process)
+                self.events.append(event)
+            self.model_runner = ModelRunner(config, 0, self.events)
+            self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+            if not config.is_multimodal:
+                config.eos = self.tokenizer.eos_token_id
+            self.scheduler = Scheduler(config)
+            atexit.register(self.exit)
+        except Exception as error:
+            try:
+                self.exit()
+            except Exception as cleanup_error:
+                raise error from cleanup_error
+            raise
 
     def exit(self):
-        self.model_runner.call("exit")
-        del self.model_runner
-        for p in self.ps:
-            p.join()
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        runner = self.model_runner
+        self.model_runner = None
+        stopped = False
+        try:
+            scheduler = getattr(self, "scheduler", None)
+            if scheduler is not None:
+                for seq in list(scheduler.waiting) + list(scheduler.running):
+                    scheduler.abort(seq)
+            if runner is not None:
+                runner.call("exit")
+                stopped = True
+        finally:
+            for process in self.ps:
+                if not stopped and process.is_alive():
+                    process.terminate()  # Only workers created by this engine.
+                process.join()
+            atexit.unregister(self.exit)
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
@@ -47,16 +72,28 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = (
-            sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        )
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [
-            (seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished
-        ]
-        return outputs, num_tokens
+        queue = self.scheduler.running or self.scheduler.waiting
+        active = queue[0] if queue else None
+        seqs = []
+        try:
+            seqs, is_prefill = self.scheduler.schedule()
+            num_tokens = (
+                sum(seq.num_scheduled_tokens for seq in seqs)
+                if is_prefill
+                else -len(seqs)
+            )
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
+            self.scheduler.postprocess(seqs, token_ids, is_prefill)
+            outputs = [
+                (seq.seq_id, seq.completion_token_ids)
+                for seq in seqs
+                if seq.is_finished
+            ]
+            return outputs, num_tokens
+        except Exception:
+            for seq in seqs or ([active] if active is not None else []):
+                self.scheduler.abort(seq)
+            raise
 
     def is_finished(self):
         return self.scheduler.is_finished()

@@ -10,7 +10,7 @@
 
 **Spec:** [已批准设计](../specs/2026-10-29-qwen3-vl-design.md)。执行者必须同时阅读两份文档。
 
-**Status:** 2026-11-07，Task2–5提交为`89c1e40`，Task6、7、8a提交为`5912fcc`；用户授权的Native Task8b已完成完整Prefill与真实分页KV绑定；本轮止于8b，不推进8c、不自动暂存/Commit/Push。HF Oracle保持持久化只读，宽BF16阈值仍未批准作自动正确性标准。当前分支`feat/multimodal`，保留个人未跟踪实验。历史报告描述当时授权状态。
+**Status:** 2026-11-08，Native Task8c完成，Task8b基线`90aeeba`未变；P1范围内纯文本Prefill/Decode及旧Qwen3回归通过，详见[Task8c报告](2026-11-08-qwen3-vl-task8c-results.md)。最终CPU186、快速31、真实GPU11项通过，FAILED/ERROR/SKIPPED均0。仅完成纯文本及生命周期收尾，不推进Task9或视觉工作，不自动暂存/Commit/Push。沿用持久化只读HF Oracle，宽BF16阈值未批准自动放行。分支`feat/multimodal`，保留全部个人未跟踪实验。
 
 ## Global Constraints
 
@@ -23,7 +23,7 @@
 - 初期 VL 禁用 prefix cache 的查找和发布，保留语言 paged KV 读写；共享组件保留针对性兼容回归，原 Qwen3-0.6B 仅保留必要加载/生成smoke，不建立全模型数值基线。
 - `enforce_eager=True` 不会自动关闭 torch.compile；正确性基线额外使用 `TORCHDYNAMO_DISABLE=1`，编译优化另行验收。
 - 16GB 下 HF 与 nano-vLLM 分进程顺序运行，参考张量落 CPU；所有 GPU 测试串行执行。
-- 当前执行授权止于Native Task8b；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
+- 当前执行授权止于Native Task8c；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
 
 ## Review Focus
 
@@ -473,8 +473,8 @@ assert_aligned("text_prefill_logits", actual_logits, hf_logits, tolerances)
 
 **Interfaces：** 消费8b缓存；产出可复现32步文本Decode和幂等exit；不预先接通图像。
 
-- [ ] **1. Collection前置检查**：`.venv/bin/python -m pytest tests/test_qwen3_vl_runner.py --collect-only -q`，节点包含`TextDecodeRunnerTests`；缺模块先补可导入接口并重试，不计red。
-- [ ] **2. 行为red**：运行`.venv/bin/python -m pytest tests/test_qwen3_vl_runner.py::TextDecodeRunnerTests -m gpu --require-gpu -q`，测试断言：
+- [x] **1. Collection前置检查**：`.venv/bin/python -m pytest tests/test_qwen3_vl_runner.py --collect-only -q`，节点包含`TextDecodeRunnerTests`；缺模块先补可导入接口并重试，不计red。
+- [x] **2. 行为red**：运行`.venv/bin/python -m pytest tests/test_qwen3_vl_runner.py::TextDecodeRunnerTests -m gpu --require-gpu -q`，测试断言：
 
 ```python
 self.assertEqual(actual_greedy_tokens, hf_greedy_tokens)
@@ -482,8 +482,10 @@ self.assertEqual(default_dtype_after_failure, default_dtype_before)
 ```
 
 记录到达的断言和不匹配值；不是setup/import错误。
-- [ ] **3. 最小实现**：Decode context/slot映射；init/run try/finally恢复默认状态；注入初始化和warmup异常，重复exit安全。
-- [ ] **4. Green/完成条件**：重跑上述命令并跑本父任务已完成子模块回归；32步teacher forcing/跨页通过；重跑1b受影响共享组件与单一原模型smoke；GPU不可用不能完成P1。保存JUnit/数值报告，进入所属里程碑质量门禁，不自动commit。
+- [x] **3. 最小实现**：Decode context/slot映射；init/run try/finally恢复默认状态；注入初始化和warmup异常，重复exit安全。
+- [x] **4. Green/完成条件**：重跑上述命令并跑本父任务已完成子模块回归；32步teacher forcing/跨页通过；重跑1b受影响共享组件与单一原模型smoke；GPU不可用不能完成P1。保存JUnit/数值报告，进入所属里程碑质量门禁，不自动commit。
+
+**2026-11-08 执行结果：** Task8c完成。24/255/256/257-token用例各完成独立Prefill后32次实际Decode输入，114浮点组件/例与HF FA2严格零误差；独立真实Engine排队生成每例32个greedy ID一致，max_tokens=1通过。初始化/prepare/forward/sample异常清理、默认device/dtype恢复、请求abort、外部Gloo组保留及重复exit通过。独立Review初次无阻塞项；之后自查发现Important参数循环引用问题，以完整模型弱引用测试RED1失败、生产exit回收修复、GREEN1通过关闭；未做第二次Review。修复后完整CPU186通过（10.04s）、快速31通过（1.76s）、正式GPU组合11通过（56.44s），FAILED/ERROR/SKIPPED均0。退出前后参数/KV释放在测试额外GC前验证。详见[Task8c报告](2026-11-08-qwen3-vl-task8c-results.md)。P1纯文本范围完成；图像、Processor、视觉融合及进程级CUDA错误恢复未验证，不开始Task9，不暂存/Commit/Push。
 
 
 ## Task 9：Processor 输入契约与请求级多模态状态

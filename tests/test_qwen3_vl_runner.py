@@ -674,12 +674,674 @@ def prefill_worker(directory):
             runner.exit()
 
 
+DECODE_EVIDENCE = EVIDENCE.parent / "task8c"
+
+
+class EngineCleanupTests(unittest.TestCase):
+    def test_run_failure_aborts_active_request_and_preserves_waiting(self):
+        from nanovllm.engine.llm_engine import LLMEngine
+        from tests.test_qwen3_vl_scheduler import sequence, vl_scheduler
+
+        class Boundary:
+            fail = True
+
+            def call(self, method, *args):
+                if self.fail:
+                    raise ValueError("injected recoverable runner failure")
+                return [8]
+
+        engine = LLMEngine.__new__(LLMEngine)
+        engine.scheduler = vl_scheduler()
+        engine.model_runner = Boundary()
+        first, second = sequence(), sequence(255, max_tokens=1)
+        engine.scheduler.add(first)
+        engine.scheduler.add(second)
+        with self.assertRaisesRegex(ValueError, "injected recoverable"):
+            engine.step()
+        self.assertTrue(first.is_finished)
+        self.assertEqual(list(engine.scheduler.waiting), [second])
+        self.assertFalse(engine.scheduler.block_manager.used_block_ids)
+        engine.model_runner.fail = False
+        outputs, _ = engine.step()
+        self.assertEqual(outputs, [(second.seq_id, [8])])
+        self.assertTrue(engine.scheduler.is_finished())
+        self.assertTrue(
+            all(b.ref_count == 0 for b in engine.scheduler.block_manager.blocks)
+        )
+
+    def test_schedule_failure_aborts_only_queue_head(self):
+        from nanovllm.engine.llm_engine import LLMEngine
+        from tests.test_qwen3_vl_scheduler import sequence, vl_scheduler
+
+        engine = LLMEngine.__new__(LLMEngine)
+        engine.scheduler = vl_scheduler(num_kvcache_blocks=2)
+        first, second = sequence(), sequence(255, max_tokens=1)
+        engine.scheduler.add(first)
+        engine.scheduler.add(second)
+        manager = engine.scheduler.block_manager
+        outsider = sequence(1)
+        manager.allocate(outsider, 0)
+        with self.assertRaisesRegex(RuntimeError, "KV.*invariant"):
+            engine.step()
+        self.assertTrue(first.is_finished)
+        self.assertEqual(list(engine.scheduler.waiting), [second])
+        manager.deallocate(outsider)
+        engine.scheduler.abort(second)
+        self.assertTrue(all(b.ref_count == 0 for b in manager.blocks))
+
+    def test_engine_exit_is_idempotent_and_cancels_queues(self):
+        from nanovllm.engine.llm_engine import LLMEngine
+        from tests.test_qwen3_vl_scheduler import sequence, vl_scheduler
+
+        class Boundary:
+            calls = 0
+
+            def call(self, method):
+                assert method == "exit"
+                self.calls += 1
+
+        engine = LLMEngine.__new__(LLMEngine)
+        engine.ps = []
+        engine.scheduler = vl_scheduler()
+        boundary = engine.model_runner = Boundary()
+        first, second = sequence(), sequence()
+        engine.scheduler.add(first)
+        engine.scheduler.add(second)
+        engine.scheduler.schedule()
+        engine.exit()
+        engine.exit()
+        self.assertEqual(boundary.calls, 1)
+        self.assertTrue(first.is_finished and second.is_finished)
+        self.assertTrue(engine.scheduler.is_finished())
+        self.assertTrue(
+            all(b.ref_count == 0 for b in engine.scheduler.block_manager.blocks)
+        )
+
+
+@pytest.mark.gpu
+class TextDecodeRunnerTests(unittest.TestCase):
+    def tearDown(self):
+        import torch
+        from nanovllm.utils.context import reset_context
+
+        reset_context()
+        torch.cuda.empty_cache()
+
+    def test_decode_positions_and_noncontiguous_page_transition(self):
+        from nanovllm.engine.model_runner import ModelRunner
+        from nanovllm.engine.sequence import Sequence
+        from nanovllm.utils.context import get_context
+
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.config = prefill_config()
+        runner.block_size = 256
+        seq = Sequence([9707] * 255)
+        for length, slot in [(256, 767), (257, 0), (258, 1)]:
+            seq.append_token(7)
+            seq.block_table = [2] if length == 256 else [2, 0]
+            ids, positions = runner.prepare_decode([seq])
+            self.assertEqual(tuple(positions.shape), (3, 1))
+            self.assertEqual(positions.tolist(), [[length - 1]] * 3)
+            self.assertEqual(ids.tolist(), [7])
+            context = get_context()
+            self.assertFalse(context.is_prefill)
+            self.assertEqual(context.slot_mapping.tolist(), [slot])
+            self.assertEqual(context.context_lens.tolist(), [length])
+            self.assertEqual(context.block_tables.tolist(), [seq.block_table])
+        with self.assertRaisesRegex(ValueError, "VL.*[Dd]ecode"):
+            runner.prepare_decode([seq, seq])
+
+    @pytest.mark.usefixtures("model_loading_rank")
+    def test_run_always_resets_context_and_preserves_exception(self):
+        import tempfile
+        import torch
+        from torch import nn
+        from nanovllm.engine.sequence import Sequence
+        from nanovllm.utils.context import get_context, reset_context, set_context
+
+        class FailSample(nn.Module):
+            def forward(self, *args):
+                raise ValueError("injected sample")
+
+        with tempfile.TemporaryDirectory() as directory:
+            runner = tiny_cuda_runner(Path(directory))
+        original_prepare, original_forward, original_sampler = (
+            runner.prepare_prefill,
+            runner.run_model,
+            runner.sampler,
+        )
+        for stage in ("prepare", "forward", "sample"):
+            with self.subTest(stage=stage):
+                runner.prepare_prefill, runner.run_model, runner.sampler = (
+                    original_prepare,
+                    original_forward,
+                    original_sampler,
+                )
+                seq = Sequence([1, 2])
+                seq.num_scheduled_tokens = 2
+                set_context(True, slot_mapping=torch.tensor([0], device="cuda"))
+
+                def fail(*args):
+                    raise ValueError(f"injected {stage}")
+
+                if stage == "prepare":
+                    runner.prepare_prefill = fail
+                elif stage == "forward":
+                    runner.run_model = fail
+                else:
+                    runner.sampler = FailSample()
+                with self.assertRaisesRegex(ValueError, f"injected {stage}"):
+                    runner.run([seq], True)
+                self.assertFalse(get_context().is_prefill)
+                self.assertIsNone(get_context().slot_mapping)
+                reset_context()
+
+    def test_init_failures_restore_defaults_and_double_exit(self):
+        import json
+        import tempfile
+        from tests.support import run_worker
+
+        DECODE_EVIDENCE.mkdir(parents=True, exist_ok=True)
+        directory = Path(tempfile.mkdtemp(prefix="lifecycle-", dir=DECODE_EVIDENCE))
+        result = run_worker(
+            "tests.test_qwen3_vl_runner", ["--lifecycle-worker", str(directory)]
+        )
+        (directory / "worker.log").write_text(result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads((directory / "lifecycle.json").read_text())
+        for stage, row in report["failures"].items():
+            with self.subTest(stage=stage):
+                self.assertIn(f"injected {stage}", row["error"])
+                self.assertEqual(row["dtype_after"], row["dtype_before"])
+                self.assertEqual(row["device_after"], row["device_before"])
+                self.assertFalse(row["group_alive"])
+                self.assertFalse(row["model_alive"])
+                self.assertFalse(row["context_present"])
+                self.assertFalse(row["pool_alive"])
+        self.assertIsNone(report["normal"]["second_exit_error"])
+        self.assertFalse(report["normal"]["group_alive"])
+        self.assertFalse(report["normal"]["model_alive"])
+        self.assertFalse(report["normal"]["pool_alive"])
+        self.assertTrue(report["engine_init"]["runner_ready"])
+        self.assertIn("injected tokenizer", report["engine_init"]["error"])
+        self.assertFalse(report["engine_init"]["group_alive"])
+        self.assertFalse(report["engine_init"]["model_alive"])
+        self.assertTrue(report["external_group_preserved"])
+
+    @pytest.mark.checkpoint
+    def test_target_32_decode_steps_and_greedy_engine(self):
+        import json
+        import tempfile
+        import torch
+        from tests.reference_qwen3_vl import assert_aligned, tensor_metrics
+        from tests.support import run_worker
+        from tests.test_qwen3_vl_text import CASES
+
+        DECODE_EVIDENCE.mkdir(parents=True, exist_ok=True)
+        directory = Path(tempfile.mkdtemp(prefix="decode-", dir=DECODE_EVIDENCE))
+        for mode in ("reference", "worker"):
+            result = run_worker(
+                "tests.test_qwen3_vl_runner", [f"--decode-{mode}", str(directory)]
+            )
+            (directory / f"{mode}.log").write_text(result.stdout + result.stderr)
+            if mode == "worker":
+                state = json.loads((directory / "native-decode.json").read_text())
+                self.assertTrue(state.get("greedy"), result.stdout + result.stderr)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        failures, metrics = [], {}
+        for case in CASES:
+            actual = torch.load(
+                directory / f"native-{case}.pt", map_location="cpu", weights_only=True
+            )
+            expected = torch.load(
+                directory / f"hf-{case}.pt", map_location="cpu", weights_only=True
+            )
+            if state["greedy"][case] != expected["teacher_ids"].tolist():
+                failures.append(f"{case}: greedy token IDs differ")
+            metrics[case] = {}
+            self.assertEqual(actual["decode.logits"].shape, (32, 151936))
+            self.assertEqual(actual.keys(), expected.keys())
+            for name, value in actual.items():
+                limits = {name: {"max_abs": 0.0, "mean_abs": 0.0, "rel_l2": 0.0}}
+                if value.is_floating_point():
+                    metrics[case][name] = tensor_metrics(value, expected[name])
+                try:
+                    assert_aligned(name, value, expected[name], limits)
+                except AssertionError as error:
+                    failures.append(f"{case}: {error}")
+        self.assertTrue(state["released_after_requests"])
+        self.assertEqual(state["max_running"], 1)
+        self.assertIsNone(state["second_exit_error"])
+        self.assertFalse(state["group_alive_after_exit"])
+        self.assertFalse(
+            state["parameters_alive_after_exit"],
+            state["parameters_alive_after_exit"][:8],
+        )
+        self.assertTrue(state["pool_released_after_exit"])
+        identity = json.loads((directory / "hf-identity.json").read_text())
+        self.assertEqual(identity["backend"], "flash_attention_2")
+        self.assertEqual(identity["gpu"], state["gpu"])
+        self.assertEqual(
+            identity["allow_bf16_reduced_precision_reduction"],
+            state["allow_bf16_reduced_precision_reduction"],
+        )
+        (directory / "comparison.json").write_text(
+            json.dumps({"metrics": metrics, "failures": failures}, indent=2)
+        )
+        self.assertFalse(
+            failures, f"{directory}: {failures[:8]} ({len(failures)} total)"
+        )
+
+
+def lifecycle_worker(directory):
+    import gc
+    import json
+    import weakref
+    import torch
+    import torch.distributed as dist
+    from unittest.mock import patch
+    import nanovllm.engine.llm_engine as engine_module
+    from nanovllm.engine.model_runner import ModelRunner
+    from nanovllm.utils.context import get_context, reset_context, set_context
+
+    tiny = directory / "tiny"
+    tiny.mkdir()
+    config, _ = tiny_model_checkpoint(tiny, multimodal=True)
+    report = {"failures": {}}
+
+    class Injected(ModelRunner):
+        stage = ""
+
+        def _load_model(self):
+            super()._load_model()
+            self.model_ref = weakref.ref(self.model)
+            if self.stage == "load":
+                raise ValueError("injected load")
+
+        def warmup_model(self):
+            if self.stage == "warmup":
+                set_context(True, slot_mapping=torch.tensor([0], device="cuda"))
+                raise ValueError("injected warmup")
+            return super().warmup_model()
+
+        def allocate_kv_cache(self):
+            super().allocate_kv_cache()
+            self.pool_ref = weakref.ref(self.kv_cache)
+            if self.stage == "allocate":
+                raise ValueError("injected allocate")
+
+    def measured(runner):
+        gc.collect()
+        return dict(
+            dtype_after=str(torch.get_default_dtype()),
+            device_after=str(torch.get_default_device()),
+            group_alive=dist.is_initialized(),
+            model_alive=runner.model_ref() is not None,
+            pool_alive=hasattr(runner, "pool_ref") and runner.pool_ref() is not None,
+            context_present=get_context().slot_mapping is not None,
+        )
+
+    def fallback_cleanup(runner):
+        # After measurement only, to let RED collect every failure safely.
+        reset_context()
+        for name in ("model", "kv_cache", "sampler"):
+            runner.__dict__.pop(name, None)
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        torch.set_default_device("cpu")
+        torch.set_default_dtype(torch.float32)
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    for stage in ("load", "warmup", "allocate"):
+        runner = Injected.__new__(Injected)
+        runner.stage = stage
+        torch.set_default_dtype(torch.float64)
+        before = dict(
+            dtype_before=str(torch.get_default_dtype()),
+            device_before=str(torch.get_default_device()),
+        )
+        try:
+            runner.__init__(config, 0, [])
+        except ValueError as error:
+            report["failures"][stage] = dict(
+                before, error=str(error), **measured(runner)
+            )
+        finally:
+            fallback_cleanup(runner)
+    runner = Injected(config, 0, [])
+    runner.exit()
+    second_exit_error = None
+    try:
+        runner.exit()
+    except Exception as error:
+        second_exit_error = repr(error)
+    report["normal"] = dict(second_exit_error=second_exit_error, **measured(runner))
+    fallback_cleanup(runner)
+    tracked = {}
+
+    class Tracked(ModelRunner):
+        def __init__(self, *args):
+            super().__init__(*args)
+            tracked.update(
+                runner_ready=True,
+                model=weakref.ref(self.model),
+                runner=weakref.ref(self),
+            )
+
+    # Inject only the tokenizer boundary after a real Runner has initialized.
+    with (
+        patch.object(engine_module, "ModelRunner", Tracked),
+        patch.object(
+            engine_module.AutoTokenizer,
+            "from_pretrained",
+            side_effect=ValueError("injected tokenizer"),
+        ),
+    ):
+        try:
+            engine_module.LLMEngine(
+                str(tiny), max_num_seqs=1, enforce_eager=True, max_model_len=64
+            )
+        except Exception as error:
+            gc.collect()
+            report["engine_init"] = dict(
+                runner_ready=tracked.get("runner_ready", False),
+                error=repr(error),
+                group_alive=dist.is_initialized(),
+                model_alive=tracked["model"]() is not None,
+            )
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    dist.init_process_group(
+        "gloo",
+        init_method=(directory / "external-rank").resolve().as_uri(),
+        rank=0,
+        world_size=1,
+    )
+    try:
+        try:
+            ModelRunner(config, 0, [])
+        except ValueError:
+            report["external_group_preserved"] = (
+                dist.is_initialized() and dist.get_backend() == "gloo"
+            )
+    finally:
+        dist.destroy_process_group()
+    (directory / "lifecycle.json").write_text(json.dumps(report, indent=2))
+
+
+def cuda_memory_record():
+    import torch
+
+    free, total = torch.cuda.mem_get_info()
+    return dict(
+        peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+        peak_reserved_bytes=torch.cuda.max_memory_reserved(),
+        allocated_bytes=torch.cuda.memory_allocated(),
+        free_bytes=free,
+        total_bytes=total,
+    )
+
+
+def decode_reference(directory):
+    import json
+    import torch
+    from transformers import Qwen3VLForConditionalGeneration as HFModel
+    from tests.reference_qwen3_vl import (
+        provenance,
+        last_step_cache,
+        stack_step_cache,
+        sample_cache,
+    )
+    from tests.test_qwen3_vl_text import CASES, load_oracle
+
+    identity = provenance(MODEL)
+    model = (
+        HFModel.from_pretrained(
+            str(MODEL),
+            dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+            local_files_only=True,
+        )
+        .cuda()
+        .eval()
+    )
+    identity.update(
+        backend=model.model.language_model.config._attn_implementation,
+        gpu=torch.cuda.get_device_name(),
+        dtype=str(next(model.parameters()).dtype),
+        allow_bf16_reduced_precision_reduction=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+        cuda=torch.version.cuda,
+        cases={},
+    )
+    for case in CASES:
+        oracle = load_oracle(case)
+        ids = oracle["input.input_ids"].cuda()
+        length = ids.shape[1]
+        positions = torch.arange(length, device="cuda").expand(3, 1, -1)
+        saved, teacher, logits = {}, [], []
+        model.model.rope_deltas = None
+        with torch.inference_mode():
+            result = model(
+                input_ids=ids,
+                attention_mask=torch.ones_like(ids),
+                position_ids=positions,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            saved["prefill.logits"] = result.logits[:, -1].cpu()
+            cache = result.past_key_values
+            next_token = int(result.logits[0, -1].argmax())
+            for step in range(32):
+                teacher.append(next_token)
+                pos = torch.full(
+                    (3, 1, 1), length + step, device="cuda", dtype=torch.long
+                )
+                result = model(
+                    input_ids=torch.tensor([[next_token]], device="cuda"),
+                    attention_mask=torch.ones(
+                        (1, length + step + 1), device="cuda", dtype=torch.long
+                    ),
+                    position_ids=pos,
+                    past_key_values=cache,
+                    use_cache=True,
+                    logits_to_keep=1,
+                )
+                cache = result.past_key_values
+                logits.append(result.logits[0, -1].cpu())
+                last_step_cache(cache, saved, "decode.step_kv")
+                next_token = int(result.logits[0, -1].argmax())
+            sample_cache(cache, saved, "decode.final_kv")
+        stack_step_cache(saved)
+        saved["teacher_ids"] = torch.tensor(teacher)
+        saved["decode.logits"] = torch.stack(logits)
+        torch.save(saved, directory / f"hf-{case}.pt")
+        identity["cases"][case] = cuda_memory_record()
+    (directory / "hf-identity.json").write_text(json.dumps(identity, indent=2))
+
+
+def decode_worker(directory):
+    import gc
+    import json
+    import traceback
+    import weakref
+    import torch
+    import torch.distributed as dist
+    from nanovllm.engine.llm_engine import LLMEngine
+    from nanovllm.engine.sequence import Sequence
+    from nanovllm.sampling_params import SamplingParams
+    from nanovllm.utils.context import get_context, reset_context
+    from tests.test_qwen3_vl_text import CASES, load_oracle
+
+    engine = None
+    report = {"greedy": {}, "contexts": {}, "cases": {}}
+
+    def save_last(runner, seq, saved):
+        slot = seq.block_table[(len(seq) - 1) // 256] * 256 + (len(seq) - 1) % 256
+        for i in range(28):
+            for kind, cache in (
+                ("keys", runner.kv_cache[0, i]),
+                ("values", runner.kv_cache[1, i]),
+            ):
+                saved.setdefault(f"decode.step_kv.{i}.{kind}", []).append(
+                    cache.view(-1, 8, 128)[slot].cpu()
+                )
+
+    try:
+        engine = LLMEngine(str(MODEL), max_num_seqs=1, enforce_eager=True)
+        runner = engine.model_runner
+        prompts = []
+        for case in CASES:
+            ids = load_oracle(case)["input.input_ids"][0].tolist()
+            prompts.append(ids)
+            reference = torch.load(
+                directory / f"hf-{case}.pt", map_location="cpu", weights_only=True
+            )
+            seq = Sequence(
+                ids, SamplingParams(temperature=0, max_tokens=33, ignore_eos=True)
+            )
+            seq.block_table = [2] if len(seq) <= 256 else [2, 0]
+            seq.num_scheduled_tokens = len(seq)
+            runner.kv_cache.fill_(float("nan"))
+            inputs, positions = runner.prepare_prefill([seq])
+            with torch.inference_mode():
+                saved = {
+                    "prefill.logits": runner.run_model(inputs, positions, True).cpu(),
+                }
+            logits, contexts, consumed = [], [], []
+            for token in reference["teacher_ids"].tolist():
+                seq.num_cached_tokens = len(seq)
+                seq.append_token(token)
+                seq.num_scheduled_tokens = 1
+                seq.is_prefill = False
+                seq.block_table = [2] if len(seq) <= 256 else [2, 0]
+                inputs, positions = runner.prepare_decode([seq])
+                consumed.append(int(inputs.item()))
+                ctx = get_context()
+                contexts.append(
+                    dict(
+                        positions=positions.cpu().tolist(),
+                        length=ctx.context_lens.tolist(),
+                        slots=ctx.slot_mapping.tolist(),
+                        blocks=ctx.block_tables.tolist(),
+                    )
+                )
+                with torch.inference_mode():
+                    logits.append(runner.run_model(inputs, positions, False)[0].cpu())
+                save_last(runner, seq, saved)
+            saved["decode.logits"] = torch.stack(logits)
+            saved["teacher_ids"] = torch.tensor(consumed)
+            for key in list(saved):
+                if ".step_kv." in key:
+                    saved[key] = torch.stack(saved[key])
+            sample = reference["decode.final_kv.sample_positions"]
+            saved["decode.final_kv.sample_positions"] = sample
+            logical = sample.cuda()
+            pages = torch.tensor([2, 0], device="cuda")
+            slots = pages[logical // 256] * 256 + logical % 256
+            for i in range(28):
+                for kind in ("keys", "values"):
+                    cache = runner.kv_cache[0 if kind == "keys" else 1, i]
+                    saved[f"decode.final_kv.{i}.{kind}"] = cache.view(-1, 8, 128)[
+                        slots
+                    ].cpu()
+            del cache
+            torch.save(saved, directory / f"native-{case}.pt")
+            report["contexts"][case] = contexts
+            report["cases"][case] = cuda_memory_record()
+            reset_context()
+        runner.kv_cache.fill_(float("nan"))
+        max_running = []
+        original_run = runner.run
+
+        def observe(seqs, prefill):
+            max_running.append(len(engine.scheduler.running))
+            assert all(not seq.block_table for seq in engine.scheduler.waiting)
+            return original_run(seqs, prefill)
+
+        runner.run = observe
+        outputs = engine.generate(
+            prompts,
+            SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
+            use_tqdm=False,
+        )
+        report["greedy"] = {
+            case: value["token_ids"] for case, value in zip(CASES, outputs)
+        }
+        report["max_running"] = max(max_running)
+        manager = engine.scheduler.block_manager
+        report["released_after_requests"] = (
+            engine.is_finished()
+            and not manager.used_block_ids
+            and all(b.ref_count == 0 for b in manager.blocks)
+            and not manager.hash_to_block_id
+        )
+        single = engine.generate(
+            [prompts[0]],
+            SamplingParams(temperature=0, max_tokens=1, ignore_eos=True),
+            use_tqdm=False,
+        )
+        assert single[0]["token_ids"] == report["greedy"][CASES[0]][:1]
+        report["before_exit_memory"] = cuda_memory_record()
+        report["dtype"] = str(next(runner.model.parameters()).dtype)
+        parameter_refs = [
+            (name, weakref.ref(parameter))
+            for name, parameter in runner.model.named_parameters()
+        ]
+        pool_ref = weakref.ref(runner.kv_cache)
+        gc_was_enabled = gc.isenabled()
+        gc.disable()  # Exit must not depend on a later automatic GC threshold.
+        try:
+            engine.exit()
+            report["parameters_alive_after_exit"] = [
+                name for name, reference in parameter_refs if reference() is not None
+            ]
+            report["pool_released_after_exit"] = pool_ref() is None
+            report["after_exit_memory"] = cuda_memory_record()
+            gc.collect()  # Diagnostic only, strictly after the asserted snapshot.
+            report["after_diagnostic_gc_memory"] = cuda_memory_record()
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+        second_error = None
+        try:
+            engine.exit()
+        except Exception as error:
+            second_error = repr(error)
+        report.update(
+            second_exit_error=second_error, group_alive_after_exit=dist.is_initialized()
+        )
+    except Exception:
+        report["exception"] = traceback.format_exc()
+        raise
+    finally:
+        report.update(
+            gpu=torch.cuda.get_device_name(),
+            allow_bf16_reduced_precision_reduction=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+        )
+        (directory / "native-decode.json").write_text(json.dumps(report, indent=2))
+        reset_context()
+        if dist.is_initialized() and engine is not None:
+            engine.exit()
+
+
 if __name__ == "__main__":
     import argparse
     import torch
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--prefill-worker", type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--prefill-worker", type=Path)
+    mode.add_argument("--lifecycle-worker", type=Path)
+    mode.add_argument("--decode-reference", type=Path)
+    mode.add_argument("--decode-worker", type=Path)
     args = parser.parse_args()
     torch.set_num_threads(1)
-    prefill_worker(args.prefill_worker)
+    if args.prefill_worker:
+        prefill_worker(args.prefill_worker)
+    elif args.lifecycle_worker:
+        lifecycle_worker(args.lifecycle_worker)
+    elif args.decode_reference:
+        decode_reference(args.decode_reference)
+    else:
+        decode_worker(args.decode_worker)
