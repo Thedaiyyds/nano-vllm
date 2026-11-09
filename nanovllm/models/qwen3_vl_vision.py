@@ -1,9 +1,10 @@
-"""Qwen3-VL vision patch embedding and spatial positions (no ViT blocks)."""
+"""Qwen3-VL vision primitives and segmented noncausal ViT blocks."""
 
 from math import isqrt
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 class Qwen3VLVisionPatchEmbed(nn.Module):
@@ -168,3 +169,84 @@ def apply_rotary_pos_emb_vision(q, k, cos, sin):
         ).to(x.dtype)
 
     return rotate(q), rotate(k)
+
+
+class Qwen3VLVisionAttention(nn.Module):
+    def __init__(self, vision_config):
+        super().__init__()
+        self.dim = vision_config.hidden_size
+        self.num_heads = vision_config.num_heads
+        if self.num_heads <= 0 or self.dim <= 0 or self.dim % self.num_heads:
+            raise ValueError("vision hidden_size must be divisible by num_heads")
+        self.head_dim = self.dim // self.num_heads
+        self.qkv = nn.Linear(self.dim, 3 * self.dim, bias=True)
+        self.proj = nn.Linear(self.dim, self.dim, bias=True)
+
+    def forward(self, hidden_states, cu_seqlens, position_embeddings):
+        if hidden_states.ndim != 2 or hidden_states.shape[1] != self.dim:
+            raise ValueError("vision hidden_states must be [P,hidden_size]")
+        if (
+            cu_seqlens.ndim != 1
+            or cu_seqlens.dtype not in (torch.int32, torch.int64)
+            or cu_seqlens.numel() < 2
+        ):
+            raise ValueError("cu_seqlens must be integer cumulative segment boundaries")
+        boundaries = cu_seqlens.tolist()
+        lengths = [end - start for start, end in zip(boundaries, boundaries[1:])]
+        if (
+            boundaries[0] != 0
+            or boundaries[-1] != hidden_states.shape[0]
+            or any(length <= 0 for length in lengths)
+        ):
+            raise ValueError("cu_seqlens must cover every patch in nonempty segments")
+        count = hidden_states.shape[0]
+        q, k, v = (
+            self.qkv(hidden_states)
+            .reshape(count, 3, self.num_heads, self.head_dim)
+            .permute(1, 0, 2, 3)
+            .unbind(0)
+        )
+        q, k = apply_rotary_pos_emb_vision(q, k, *position_embeddings)
+        splits = [
+            tensor.transpose(0, 1).unsqueeze(0).split(lengths, dim=2)
+            for tensor in (q, k, v)
+        ]
+        output = [
+            F.scaled_dot_product_attention(
+                q, k, v, dropout_p=0.0, is_causal=False, scale=self.head_dim**-0.5
+            )
+            .transpose(1, 2)
+            .contiguous()
+            for q, k, v in zip(*splits)
+        ]
+        return self.proj(torch.cat(output, dim=1).reshape(count, self.dim).contiguous())
+
+
+class Qwen3VLVisionMLP(nn.Module):
+    def __init__(self, vision_config):
+        super().__init__()
+        self.linear_fc1 = nn.Linear(
+            vision_config.hidden_size, vision_config.intermediate_size, bias=True
+        )
+        self.linear_fc2 = nn.Linear(
+            vision_config.intermediate_size, vision_config.hidden_size, bias=True
+        )
+        self.act_fn = nn.GELU(approximate="tanh")
+
+    def forward(self, hidden_states):
+        return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_states)))
+
+
+class Qwen3VLVisionBlock(nn.Module):
+    def __init__(self, vision_config):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(vision_config.hidden_size, eps=1e-6)
+        self.norm2 = nn.LayerNorm(vision_config.hidden_size, eps=1e-6)
+        self.attn = Qwen3VLVisionAttention(vision_config)
+        self.mlp = Qwen3VLVisionMLP(vision_config)
+
+    def forward(self, hidden_states, cu_seqlens, position_embeddings):
+        hidden_states = hidden_states + self.attn(
+            self.norm1(hidden_states), cu_seqlens, position_embeddings
+        )
+        return hidden_states + self.mlp(self.norm2(hidden_states))
