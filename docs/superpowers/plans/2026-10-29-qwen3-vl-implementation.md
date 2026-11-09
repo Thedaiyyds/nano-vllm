@@ -10,7 +10,7 @@
 
 **Spec:** [已批准设计](../specs/2026-10-29-qwen3-vl-design.md)。执行者必须同时阅读两份文档。
 
-**Status:** 2026-11-09，Task11a已Commit60ca881且用户确认已Push；本轮Native Task11b技术验收完成。主及三组DeepStack实际权重共24keys严格加载，4组×6用例的96项计算输出与24项输入三指标全零；完整CPU292、快速31、所属视觉CPU23、最终GPU1及前置GPU2通过，FAILED/ERROR/SKIPPED均0。独立Review规格/质量PASS，无Critical/Important/Minor。见[Task11b报告](2026-11-09-qwen3-vl-task11b-results.md)。未暂存/Commit/Push，下一11c未启动；正式Oracle只读，宽BF16阈值未批准。
+**Status:** 2026-11-09，Task11b已Commit09aae57且用户确认已Push；本轮Native Task11c及M2b本地技术验收完成。完整315视觉keys实际流式加载，12例全部24层和四路特征348项三指标全零，完整CPU298、快速31、视觉CPU29、最终GPU1及M2b回归GPU5通过，FAILED/ERROR/SKIPPED均0。独立Review规格/质量PASS，Critical/Important/Minor均0。见[Task11c报告](2026-11-09-qwen3-vl-task11c-results.md)。未暂存/Commit/Push，Task12未启动；Oracle只读，宽BF16阈值未批准，远程CI未运行。
 
 ## Global Constraints
 
@@ -23,7 +23,7 @@
 - 初期 VL 禁用 prefix cache 的查找和发布，保留语言 paged KV 读写；共享组件保留针对性兼容回归，原 Qwen3-0.6B 仅保留必要加载/生成smoke，不建立全模型数值基线。
 - `enforce_eager=True` 不会自动关闭 torch.compile；正确性基线额外使用 `TORCHDYNAMO_DISABLE=1`，编译优化另行验收。
 - 16GB 下 HF 与 nano-vLLM 分进程顺序运行，参考张量落 CPU；所有 GPU 测试串行执行。
-- 当前执行授权恢复至Native Task11b；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
+- 当前执行授权恢复至Native Task11c；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
 
 ## Review Focus
 
@@ -114,7 +114,7 @@ uv用于指定解释器下的工具安装/包清单；测试用`.venv/bin/python
 
 ### 测试命令、TDD与证据
 
-以下为执行命令约定；当前执行范围为Task11b，工具安装单独批准，Task11c及以后命令不执行。仓库根目录：
+以下为执行命令约定；当前执行范围为Task11c，工具安装单独批准，Task12及以后命令不执行。仓库根目录：
 
 ```bash
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TORCHDYNAMO_DISABLE=1
@@ -147,7 +147,7 @@ GPU显式命令加`--require-gpu -m gpu`；此选项不是pytest内置选项，�
 
 ## Git工作流、里程碑Review与质量门禁
 
-当前按用户要求Native恢复执行Task11b；需要时隔离工作区，任务结束进行独立Review，禁止暂存/commit/push。每次开始开发先运行：
+当前按用户要求Native恢复执行Task11c；需要时隔离工作区，任务结束进行独立Review，禁止暂存/commit/push。每次开始开发先运行：
 
 ```bash
 git status --short --branch
@@ -609,8 +609,8 @@ assert_aligned("deep_merger", actual_deep, hf_deep, tolerances)
 
 **Interfaces：** 消费patch/positions/blocks/mergers；产出父节Qwen3VLVisionModel tuple(main,list[3])。
 
-- [ ] **1. Collection前置检查**：`.venv/bin/python -m pytest tests/test_qwen3_vl_vision.py --collect-only -q`，节点包含`VisionTests`；缺模块先补可导入接口并重试，不计red。
-- [ ] **2. 行为red**：运行`.venv/bin/python -m pytest tests/test_qwen3_vl_vision.py::VisionTests -m gpu --require-gpu -q`，测试断言：
+- [x] **1. Collection前置检查**：`.venv/bin/python -m pytest tests/test_qwen3_vl_vision.py --collect-only -q`，节点包含`VisionTests`；缺模块先补可导入接口并重试，不计red。
+- [x] **2. 行为red**：运行`.venv/bin/python -m pytest tests/test_qwen3_vl_vision.py::VisionTests -m gpu --require-gpu -q`，测试断言：
 
 ```python
 self.assertEqual(len(deepstack), 3)
@@ -619,9 +619,11 @@ assert_aligned("vision_layer_17", actual_layer_17, hf_layer_17, tolerances)
 ```
 
 记录到达的断言和不匹配值；不是setup/import错误。
-- [ ] **3. 最小实现**：提取零起点5/11/17完整block输出，主路取末层；逐tensor实载视觉权重并审计覆盖。
-- [ ] **4. Green/完成条件**：重跑上述命令并跑本父任务已完成子模块回归；方图/非方图/真实图/上限P1024逐层通过，输出顺序与占位符契合，记录视觉峰值。保存JUnit/数值报告，进入所属里程碑质量门禁，不自动commit。
+- [x] **3. 最小实现**：提取零起点5/11/17完整block输出，主路取末层；逐tensor实载视觉权重并审计覆盖。
+- [x] **4. Green/完成条件**：重跑上述命令并跑本父任务已完成子模块回归；方图/非方图/真实图/上限P1024逐层通过，输出顺序与占位符契合，记录视觉峰值。保存JUnit/数值报告，进入所属里程碑质量门禁，不自动commit。
 
+
+**2026-11-09 执行结果：** 完整24层视觉模型追加完成，消费已验收patch/绝对位置/轴向RoPE/分段Attention/merger，提取完整零起点5/11/17输出。全部315视觉keys实际流式加载，310语言keys明确排除，HF/native独立进程串行；12用例全部24层及四路输出348项三指标全零，图/时间组隔离精确，矩形四路均[96,2048]。初始GPU有效数值RED vision_layer_17 max_abs331.75>0，最终正式GPU1通过57.12s；完整CPU298通过10.00s、视觉CPU29通过1.93s、快速31通过1.68s，M2b前置三项视觉GPU+旧Qwen3两项GPU共5通过87.23s。三项选层/返回顺序/跨图Attention扰动触发数值失败。独立Review规格/质量PASS、Critical0/Important0/Minor0，独立CPU6通过并复算348保存Tensor，不独立重跑GPU。旧组件前缀和54项保护哈希未变，Oracle只读。见[Task11c报告](2026-11-09-qwen3-vl-task11c-results.md)。Task11及M2b本地技术门禁完成，未暂存/Commit/Push，Task12未开始。
 
 ## Task 12：主视觉融合和 DeepStack 注入
 

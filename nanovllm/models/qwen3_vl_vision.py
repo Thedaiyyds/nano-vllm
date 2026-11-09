@@ -274,3 +274,50 @@ class Qwen3VLVisionPatchMerger(nn.Module):
             else hidden_states
         ).view(-1, self.hidden_size)
         return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_states)))
+
+
+class Qwen3VLVisionModel(nn.Module):
+    def __init__(self, vision_config):
+        super().__init__()
+        self.spatial_merge_size = vision_config.spatial_merge_size
+        self.patch_embed = Qwen3VLVisionPatchEmbed(vision_config)
+        self.pos_embed = nn.Embedding(
+            vision_config.num_position_embeddings, vision_config.hidden_size
+        )
+        self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(vision_config)
+        self.blocks = nn.ModuleList(
+            Qwen3VLVisionBlock(vision_config) for _ in range(vision_config.depth)
+        )
+        self.merger = Qwen3VLVisionPatchMerger(vision_config)
+        self.deepstack_visual_indexes = tuple(vision_config.deepstack_visual_indexes)
+        self.deepstack_merger_list = nn.ModuleList(
+            Qwen3VLVisionPatchMerger(vision_config, use_postshuffle_norm=True)
+            for _ in self.deepstack_visual_indexes
+        )
+
+    def forward(self, pixel_values, grid_thw):
+        _validate_grid(grid_thw, self.spatial_merge_size)
+        if (
+            pixel_values.ndim != 2
+            or pixel_values.shape[0] != grid_thw.prod(dim=1).sum().item()
+        ):
+            raise ValueError("pixel_values rows must match grid_thw patch count")
+        grid = grid_thw.to(pixel_values.device)
+        hidden = self.patch_embed(pixel_values)
+        absolute = interpolate_vision_positions(
+            self.pos_embed.weight, grid, self.spatial_merge_size
+        )
+        hidden = hidden + absolute.to(hidden.dtype)
+        positions = vision_position_ids(grid, self.spatial_merge_size)
+        position_embeddings = self.rotary_pos_emb(positions)
+        lengths = torch.repeat_interleave(grid[:, 1] * grid[:, 2], grid[:, 0])
+        cu_seqlens = F.pad(lengths.cumsum(0, dtype=torch.int32), (1, 0))
+        deepstack = []
+        for index, block in enumerate(self.blocks):
+            hidden = block(hidden, cu_seqlens, position_embeddings)
+            if index in self.deepstack_visual_indexes:
+                merger = self.deepstack_merger_list[
+                    self.deepstack_visual_indexes.index(index)
+                ]
+                deepstack.append(merger(hidden))
+        return self.merger(hidden), deepstack
