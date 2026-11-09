@@ -10,7 +10,7 @@
 
 **Spec:** [已批准设计](../specs/2026-10-29-qwen3-vl-design.md)。执行者必须同时阅读两份文档。
 
-**Status:** 2026-11-08，Native Task8c完成，Task8b基线`90aeeba`未变；P1范围内纯文本Prefill/Decode及旧Qwen3回归通过，详见[Task8c报告](2026-11-08-qwen3-vl-task8c-results.md)。最终CPU186、快速31、真实GPU11项通过，FAILED/ERROR/SKIPPED均0。仅完成纯文本及生命周期收尾，不推进Task9或视觉工作，不自动暂存/Commit/Push。沿用持久化只读HF Oracle，宽BF16阈值未批准自动放行。分支`feat/multimodal`，保留全部个人未跟踪实验。
+**Status:** 2026-11-09，Task9开发及复审已验收，沿用其现有工作区；Task10视觉patch/绝对位置/二维RoPE技术验收通过，详见[Task10报告](2026-11-09-qwen3-vl-task10-results.md)。所属CPU11项、完整CPU280项、快速CPU31项及真实GPU1项（七用例）通过，最终FAILED/ERROR/SKIPPED均0。初始RED仅为接口/schema过渡，后续数值扰动验证及其时序限制如实保留。Task9原文件未改，不做Git整理；不推进Task11、不暂存/Commit/Push。持久化HF Oracle只读，宽BF16阈值未批准自动放行。
 
 ## Global Constraints
 
@@ -23,7 +23,7 @@
 - 初期 VL 禁用 prefix cache 的查找和发布，保留语言 paged KV 读写；共享组件保留针对性兼容回归，原 Qwen3-0.6B 仅保留必要加载/生成smoke，不建立全模型数值基线。
 - `enforce_eager=True` 不会自动关闭 torch.compile；正确性基线额外使用 `TORCHDYNAMO_DISABLE=1`，编译优化另行验收。
 - 16GB 下 HF 与 nano-vLLM 分进程顺序运行，参考张量落 CPU；所有 GPU 测试串行执行。
-- 当前执行授权止于Native Task8c；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
+- 当前执行授权止于Native Task10；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
 
 ## Review Focus
 
@@ -496,7 +496,7 @@ self.assertEqual(default_dtype_after_failure, default_dtype_before)
 
 **Interfaces：** `PreparedMultimodalPrompt` 字段：`token_ids: list[int]`、`pixel_values: Tensor[P,1536]`、`image_grid_thw: Tensor[I,3]`、`mm_token_type_ids: Tensor[L]`（CPU）。`prepare_multimodal(messages: list[dict], processor, *, max_visual_tokens: int=256) -> PreparedMultimodalPrompt`；`validate_multimodal(prompt, hf_config, *, max_visual_tokens: int) -> None`。Sequence 新增 keyword-only `multimodal: PreparedMultimodalPrompt|None=None`，拥有 `prompt_positions: Tensor|None`、`rope_delta: int=0`、`visual_mask: Tensor|None`，CPU 数据复制/拥有，不引用可被调用者修改的张量。位置由 Task 3 计算。
 
-- [ ] **1. 写 `InputTests.test_processor_grid_and_validation`：** 方图/非方图与 HF 的 IDs、grid、pixels、模态类型一致；T!=1、奇数 H/W、像素数错、image 数量不符、空 prompt、孤立占位符、video、多图、padding、超256视觉 token 均在分配 KV 前报错。`test_request_owns_cpu_state` 修改原输入后 Sequence 内容不变。
+- [x] **1. 写 `InputTests.test_processor_grid_and_validation`：** 方图/非方图与 HF 的 IDs、grid、pixels、模态类型一致；T!=1、奇数 H/W、像素数错、image 数量不符、空 prompt、孤立占位符、video、多图、padding、超256视觉 token 均在分配 KV 前报错。`test_request_owns_cpu_state` 修改原输入后 Sequence 内容不变。
 
 ```python
 self.assertEqual(prepared.image_grid_thw.tolist(), [[1, 16, 24]])
@@ -506,9 +506,11 @@ with self.assertRaises(ValueError):
     validate_multimodal(prompt_with_bad_grid, hf_config, max_visual_tokens=256)
 ```
 
-- [ ] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_input.py -m "not gpu" -q`，先通过collection，再由具体数值/状态断言失败构成red。
-- [ ] **3. 实现 CPU 预处理和校验。** 按固定 HF 版本把处理参数放入 `processor_kwargs`；像素/视觉 token 上限明确传入并二次检查，不随意猜图像 resize 后 token 数。入口支持原 str/list[int] 和 Prepared；batch 内可排队多请求，但每请求最多一图。此阶段识别合法 Prepared 后仍明确报“模型图像执行尚未接通”，Task 13 才解除，禁止丢弃图片继续走纯文本。
-- [ ] **4. green/验收：** CPU pytest通过；纯文本 image/video 孤立 token 也拒绝。grid 接口 I 可变但首期校验 I=1；Sequence 不新增 GPU 张量或 TP 序列化负担，原文本请求可继续使用。
+- [x] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_input.py -m "not gpu" -q`，先通过collection，再由具体数值/状态断言失败构成red。
+- [x] **3. 实现 CPU 预处理和校验。** 按固定 HF 版本把处理参数放入 `processor_kwargs`；像素/视觉 token 上限明确传入并二次检查，不随意猜图像 resize 后 token 数。入口支持原 str/list[int] 和 Prepared；batch 内可排队多请求，但每请求最多一图。此阶段识别合法 Prepared 后仍明确报“模型图像执行尚未接通”，Task 13 才解除，禁止丢弃图片继续走纯文本。
+- [x] **4. green/验收：** CPU pytest通过；纯文本 image/video 孤立 token 也拒绝。grid 接口 I 可变但首期校验 I=1；Sequence 不新增 GPU 张量或 TP 序列化负担，原文本请求可继续使用。
+
+**2026-11-08 执行结果：** Task9完成。真实HF Processor方图/矩形/上限图的CPU pixels、IDs、grid、模态类型与直接调用和持久化只读Oracle精确一致；Sequence复制请求数据，三轴位置/delta与HF一致，受控别名及位置扰动均触发有效断言。输入83项通过，完整CPU269通过（9.56s）、快速31通过（1.68s）、既有文本GPU11通过（52.83s），最终FAILED/ERROR/SKIPPED均0。独立Review发现1项Important：字符串/别名来源的动画可被HF静默截为首帧；新增来源矩阵RED11失败后，明确只接受canonical image字段中的已解码静态PIL对象，路径/URL/base64及别名提前报错，完整回归关闭问题，无二次Review。Sequence保持原TP序列化AST；目标merge2以外布局明确拒绝。合法图片生成仍NotImplemented、未进入Scheduler/KV；没有实现视觉网络/融合或图像Decode。详见[Task9报告](2026-11-08-qwen3-vl-task9-results.md)。不开始Task10、不暂存/Commit/Push。
 
 ## Task 10：视觉 patch embedding 与两种视觉位置编码
 
@@ -518,7 +520,7 @@ with self.assertRaises(ValueError):
 
 **Interfaces：** `Qwen3VLVisionPatchEmbed(vision_config).forward(pixel_values: Tensor) -> Tensor[P,1024]`；`vision_position_ids(grid_thw: Tensor, merge_size: int) -> Tensor[P,2]`；`interpolate_vision_positions(weight: Tensor, grid_thw: Tensor, merge_size: int) -> Tensor[P,1024]`；`Qwen3VLVisionRotaryEmbedding(vision_config).forward(position_ids: Tensor) -> tuple[Tensor,Tensor]` 输出 `[P,64]` FP32 cos/sin。
 
-- [ ] **1. 写 `VisionPositionTests.test_patch_order_interpolation_rope`：** 4×4 可辨认 patch 保持 Processor 的2×2块顺序；48×48表的原尺寸、非方网格、插值边界与 HF 对齐；theta=10000，head_dim=64，频率 `[H,W,H,W]`，不是语言三轴。单图重复时间帧只由 Processor 产生，模型不得再次复制。
+- [x] **1. 写 `VisionPositionTests.test_patch_order_interpolation_rope`：** 4×4 可辨认 patch 保持 Processor 的2×2块顺序；48×48表的原尺寸、非方网格、插值边界与 HF 对齐；theta=10000，head_dim=64，频率 `[H,W,H,W]`，不是语言三轴。单图重复时间帧只由 Processor 产生，模型不得再次复制。
 
 ```python
 self.assertEqual(vision_position_ids(torch.tensor([[1, 4, 4]]), 2)[:4].tolist(),
@@ -526,9 +528,11 @@ self.assertEqual(vision_position_ids(torch.tensor([[1, 4, 4]]), 2)[:4].tolist(),
 assert_aligned("vision_absolute_position", actual_pos_embeds, hf_pos_embeds, tolerances)
 ```
 
-- [ ] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_vision_positions.py -m "not gpu" -q`，先通过collection，再由具体数值/状态断言失败构成red。
-- [ ] **3. 实现 Conv3d/插值/二维 RoPE。** Conv kernel/stride=(2,16,16)，含 bias；按四邻点 FP32 加权、align_corners=True/border clamp 和 HF cast 顺序。位置坐标与输入顺序一致，T 按 grid 重复；视觉旋转 Q/K 在 FP32 后回原 dtype。
-- [ ] **4. green/验收：** 所属CPU pytest模块与 `.venv/bin/python -m pytest tests/test_qwen3_vl_vision_positions.py::VisionPositionGPUTests -m gpu --require-gpu -q` 通过；单独加载视觉对应权重，patch 输出和加绝对位置后的 hidden 分别对齐。长宽交换的图必须覆盖，不能只测正方形。
+- [x] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_vision_positions.py -m "not gpu" -q`，先通过collection，再由具体数值/状态断言失败构成red。
+- [x] **3. 实现 Conv3d/插值/二维 RoPE。** Conv kernel/stride=(2,16,16)，含 bias；按四邻点 FP32 加权、align_corners=True/border clamp 和 HF cast 顺序。位置坐标与输入顺序一致，T 按 grid 重复；视觉旋转 Q/K 在 FP32 后回原 dtype。
+- [x] **4. green/验收：** 所属CPU pytest模块与 `.venv/bin/python -m pytest tests/test_qwen3_vl_vision_positions.py::VisionPositionGPUTests -m gpu --require-gpu -q` 通过；单独加载视觉对应权重，patch 输出和加绝对位置后的 hidden 分别对齐。长宽交换的图必须覆盖，不能只测正方形。
+
+**2026-11-09 执行结果：** 新增vision primitives及测试，未修改此前生产模块。真实checkpoint只读加载patch weight/bias与pos_embed三项权重，七个图像用例（含16×24/24×16）每例七浮点组件max_abs/mean_abs/relL2全0，位置精确一致；无宽BF16放行。CPU11通过、完整CPU280通过（10.00s）、快速31通过（1.67s）、最终正式GPU1通过（23.63s），FAILED/ERROR/SKIPPED均0。独立Review无Critical/Important/Minor，独立CPU11通过，未独立重跑GPU。流程限制：初始RED仅NotImplemented/schema过渡，三项数值/布局扰动在实现后触发有效断言，不能倒写为最初的数值RED。详见[Task10报告](2026-11-09-qwen3-vl-task10-results.md)。Task9及Oracle保护哈希未变，保留其现有Git状态；无ViT/merger/融合/图像执行/TP扩展，不开始Task11、不暂存/Commit/Push。
 
 ## Task 11：ViT blocks、主 merger 和三组 DeepStack merger
 

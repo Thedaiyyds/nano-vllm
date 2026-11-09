@@ -10,6 +10,11 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.utils.multimodal import (
+    PreparedMultimodalPrompt,
+    validate_multimodal,
+    validate_text_tokens,
+)
 
 
 class LLMEngine:
@@ -17,6 +22,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -65,10 +71,32 @@ class LLMEngine:
                 process.join()
             atexit.unregister(self.exit)
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(
+        self,
+        prompt: str | list[int] | PreparedMultimodalPrompt,
+        sampling_params: SamplingParams,
+    ):
+        multimodal = None
+        if isinstance(prompt, PreparedMultimodalPrompt):
+            if not self.config.is_multimodal:
+                raise ValueError("Prepared input requires a Qwen3-VL engine")
+            validate_multimodal(
+                prompt,
+                self.config.hf_config,
+                max_visual_tokens=self.config.max_visual_tokens,
+            )
+            if len(prompt.image_grid_thw):
+                raise NotImplementedError(
+                    "Model image execution is not connected yet (Task13)"
+                )
+            multimodal, prompt = prompt, prompt.token_ids
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
+        if not isinstance(prompt, list) or not prompt:
+            raise ValueError("Prompt must contain at least one token")
+        if self.config.is_multimodal:
+            validate_text_tokens(prompt, self.config.hf_config)
+        seq = Sequence(prompt, sampling_params, multimodal=multimodal)
         self.scheduler.add(seq)
 
     def step(self):
@@ -100,7 +128,7 @@ class LLMEngine:
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]],
+        prompts: list[str | list[int] | PreparedMultimodalPrompt],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
