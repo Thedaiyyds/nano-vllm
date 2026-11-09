@@ -250,3 +250,27 @@ class Qwen3VLVisionBlock(nn.Module):
             self.norm1(hidden_states), cu_seqlens, position_embeddings
         )
         return hidden_states + self.mlp(self.norm2(hidden_states))
+
+
+class Qwen3VLVisionPatchMerger(nn.Module):
+    def __init__(self, vision_config, *, use_postshuffle_norm=False):
+        super().__init__()
+        self.hidden_size = (
+            vision_config.hidden_size * vision_config.spatial_merge_size**2
+        )
+        self.use_postshuffle_norm = use_postshuffle_norm
+        self.norm = nn.LayerNorm(
+            self.hidden_size if use_postshuffle_norm else vision_config.hidden_size,
+            eps=1e-6,
+        )
+        self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
+        self.act_fn = nn.GELU()
+        self.linear_fc2 = nn.Linear(self.hidden_size, vision_config.out_hidden_size)
+
+    def forward(self, hidden_states):
+        hidden_states = self.norm(
+            hidden_states.view(-1, self.hidden_size)
+            if self.use_postshuffle_norm
+            else hidden_states
+        ).view(-1, self.hidden_size)
+        return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_states)))
