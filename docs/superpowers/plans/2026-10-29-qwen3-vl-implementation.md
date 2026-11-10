@@ -10,7 +10,7 @@
 
 **Spec:** [已批准设计](../specs/2026-10-29-qwen3-vl-design.md)。执行者必须同时阅读两份文档。
 
-**Status:** 2026-11-09，Task11b已Commit09aae57且用户确认已Push；本轮Native Task11c及M2b本地技术验收完成。完整315视觉keys实际流式加载，12例全部24层和四路特征348项三指标全零，完整CPU298、快速31、视觉CPU29、最终GPU1及M2b回归GPU5通过，FAILED/ERROR/SKIPPED均0。独立Review规格/质量PASS，Critical/Important/Minor均0。见[Task11c报告](2026-11-09-qwen3-vl-task11c-results.md)。未暂存/Commit/Push，Task12未启动；Oracle只读，宽BF16阈值未批准，远程CI未运行。
+**Status:** 2026-11-10，Native Task12本地技术验收完成。完整625源tensor实载无skip，HF固定特征/native自编码两组GPU2项通过51.16s，全部计算对照三指标0；完整CPU313、快速CPU31、既有text/vision GPU8通过。独立Review规格/质量PASS，Critical/Important/Minor均0。见[Task12报告](2026-11-10-qwen3-vl-task12-results.md)。未暂存/Commit/Push，不开始Task13；Oracle只读，宽BF16阈值未批准，远程CI未运行。
 
 ## Global Constraints
 
@@ -23,7 +23,7 @@
 - 初期 VL 禁用 prefix cache 的查找和发布，保留语言 paged KV 读写；共享组件保留针对性兼容回归，原 Qwen3-0.6B 仅保留必要加载/生成smoke，不建立全模型数值基线。
 - `enforce_eager=True` 不会自动关闭 torch.compile；正确性基线额外使用 `TORCHDYNAMO_DISABLE=1`，编译优化另行验收。
 - 16GB 下 HF 与 nano-vLLM 分进程顺序运行，参考张量落 CPU；所有 GPU 测试串行执行。
-- 当前执行授权恢复至Native Task11c；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
+- 当前执行授权为Native Task12；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
 
 ## Review Focus
 
@@ -114,7 +114,7 @@ uv用于指定解释器下的工具安装/包清单；测试用`.venv/bin/python
 
 ### 测试命令、TDD与证据
 
-以下为执行命令约定；当前执行范围为Task11c，工具安装单独批准，Task12及以后命令不执行。仓库根目录：
+以下为执行命令约定；当前执行范围为Task12，工具安装单独批准，Task13及以后命令不执行。仓库根目录：
 
 ```bash
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TORCHDYNAMO_DISABLE=1
@@ -629,11 +629,11 @@ assert_aligned("vision_layer_17", actual_layer_17, hf_layer_17, tolerances)
 
 **前置依赖：** Tasks 5、9、11。
 
-**Files：** Modify `nanovllm/models/qwen3_vl.py`；Create `tests/test_qwen3_vl_fusion.py`。
+**Files：** Modify `nanovllm/models/qwen3_vl.py`；Create `tests/test_qwen3_vl_fusion.py`。最小附加范围：更新 `tests/test_qwen3_vl_text.py` 中原“视觉不可用”的过渡测试为paired输入提前校验；其余既有测试不变。
 
 **Interfaces：** 实现 Task 5 已预留的 visual_features/visual_mask；`encode_images(pixel_values: Tensor, grid_thw: Tensor) -> tuple[Tensor,list[Tensor]]` 在 VL wrapper 调用自实现视觉模型。构造 `text_only=False` 时注册 `model.visual`；生产最终将只使用该完整形式。
 
-- [ ] **1. 写 `FusionTests.test_replacement_and_deepstack`：** 主特征替换 image_pad embedding；非视觉位置 embedding 不变。仅 decoder0/1/2完整 residual 之后向视觉位置分别加三路特征；第3层不再注入。mask/V/DeepStack 长度或隐藏维度不符均报错。对比 HF 前三层注入后的完整 hidden 与最终 norm。
+- [x] **1. 写 `FusionTests.test_replacement_and_deepstack`：** 主特征替换 image_pad embedding；非视觉位置 embedding 不变。仅 decoder0/1/2完整 residual 之后向视觉位置分别加三路特征；第3层不再注入。mask/V/DeepStack 长度或隐藏维度不符均报错。对比 HF 前三层注入后的完整 hidden 与最终 norm。
 
 ```python
 torch.testing.assert_close(fused[visual_mask], main, rtol=0, atol=0)
@@ -641,9 +641,13 @@ torch.testing.assert_close(fused[~visual_mask], token_embeds[~visual_mask], rtol
 assert_aligned("deepstack_after_layer_2", actual_after_layer_2, hf_after_layer_2, tolerances)
 ```
 
-- [ ] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_fusion.py -m gpu --require-gpu -q`，collection通过后由融合替换/DeepStack实际输出断言失败；单纯NotImplementedError只算过渡状态，不足以完成red证据。
-- [ ] **3. 实现融合。** 顺序按 mask 对应主和 DeepStack 特征；不在尚未合并的 residual 或 norm 前注入。先用 HF 特征 fixture 隔离融合错误，再换 Task 11 自实现特征重跑；两种测试均须保留清晰标记。
-- [ ] **4. green/验收：** GPU pytest两组对照都通过；完整 checkpoint 加载625 tensor，无视觉 skip，embedding/head共享。单图 Prefill 最后 logits 达阈值，但此任务不声称 Runner 的图像请求生命周期已接通。
+- [x] **2. red：** `.venv/bin/python -m pytest tests/test_qwen3_vl_fusion.py -m gpu --require-gpu -q`，collection通过后由融合替换/DeepStack实际输出断言失败；单纯NotImplementedError只算过渡状态，不足以完成red证据。
+- [x] **3. 实现融合。** 顺序按 mask 对应主和 DeepStack 特征；不在尚未合并的 residual 或 norm 前注入。先用 HF 特征 fixture 隔离融合错误，再换 Task 11 自实现特征重跑；两种测试均须保留清晰标记。
+- [x] **4. green/验收：** GPU pytest两组对照都通过；完整 checkpoint 加载625 tensor，无视觉 skip，embedding/head共享。单图 Prefill 最后 logits 达阈值，但此任务不声称 Runner 的图像请求生命周期已接通。
+
+**2026-11-10 实施结果（待独立Review）：** 完整wrapper加载625真实源tensor、无visual skip、embedding/head同Parameter；HF固定特征与native自编码两模式各六图，120项对照三指标全0（其中24项fixed视觉输入复制，96项native计算）。首次GPU有效RED2failed39.18s；最终CPU313passed11.69s、GPU2passed51.16s、既有text/visionGPU8passed141.88s。mask/order/placement三项进程内错误均有效数值失败，生产源码未改。快速与禁止模型栈CI各31通过，保护SHA其余54项不变。详见[Task12报告](2026-11-10-qwen3-vl-task12-results.md)。独立Review待安排；无Runner图像接通/Task13/Stage/Commit/Push。
+
+**2026-11-10 执行结果：** model.visual及encode_images接通；主视觉mask替换和decoder0/1/2完整residual后注入，三路输入全部提前校验。625源tensor实载无skip且head/embedding共享。两具名GPU模式六图对照2通过51.16s，96项计算结果与24项固定输入区分记录、三指标全零；CPU313通过11.69s，quick31通过，旧text/visionGPU8通过141.88s。有效GPU RED为fused失配9.8125，错mask/order/placement三项真实数值扰动失败。独立Review PASS，无Critical/Important/Minor；真实GPU未由Reviewer重复运行。唯一额外旧文件为更新过时text视觉未接通断言。见[Task12报告](2026-11-10-qwen3-vl-task12-results.md)。仅模型级验收，Task13/14生命周期未接通，未暂存/Commit/Push。
 
 ## Task 13：图文 Runner、视觉 profile 与完整 Prefill
 

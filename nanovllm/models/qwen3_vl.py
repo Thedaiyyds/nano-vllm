@@ -1,4 +1,4 @@
-"""Qwen3-VL text decoder with explicit HF residual and rounding order."""
+"""Native Qwen3-VL vision/text fusion with explicit HF residual rounding order."""
 
 import torch
 import torch.distributed as dist
@@ -134,20 +134,23 @@ class Qwen3VLTextModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, input_ids, positions):
+    def forward(self, input_ids, positions, *, visual_features=None, visual_mask=None):
         hidden_states = self.embed_tokens(input_ids)
-        for layer in self.layers:
+        if visual_features is not None:
+            main, deepstack = visual_features
+            hidden_states[visual_mask] = main
+        for index, layer in enumerate(self.layers):
             hidden_states = layer(positions, hidden_states)
+            if visual_features is not None and index < 3:
+                hidden_states[visual_mask] = (
+                    hidden_states[visual_mask] + deepstack[index]
+                )
         return self.norm(hidden_states)
 
 
 class Qwen3VLForConditionalGeneration(nn.Module):
     def __init__(self, config, *, text_only=True):
         super().__init__()
-        if not text_only:
-            raise NotImplementedError(
-                "Qwen3-VL vision modules are not connected in Task 5"
-            )
         if dist.get_world_size() != 1:
             raise ValueError("Qwen3-VL text model currently requires TP=1")
         if not config.tie_word_embeddings:
@@ -155,16 +158,59 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.config = config
         text = config.text_config
         self.model = nn.Module()
+        if not text_only:
+            from nanovllm.models.qwen3_vl_vision import Qwen3VLVisionModel
+
+            self.model.visual = Qwen3VLVisionModel(config.vision_config)
         self.model.language_model = Qwen3VLTextModel(text)
         self.lm_head = ParallelLMHead(text.vocab_size, text.hidden_size)
         self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
     def forward(self, input_ids, positions, *, visual_features=None, visual_mask=None):
-        if visual_features is not None or visual_mask is not None:
-            raise NotImplementedError(
-                "Qwen3-VL visual feature fusion is not connected in Task 5"
+        # Validate all three branches before any decoder can write language KV.
+        if (visual_features is None) != (visual_mask is None):
+            raise ValueError(
+                "visual_features and visual_mask must be provided together"
             )
-        return self.model.language_model(input_ids, positions)
+        if visual_features is not None:
+            if (
+                not isinstance(visual_mask, torch.Tensor)
+                or visual_mask.dtype != torch.bool
+                or visual_mask.ndim != 1
+                or visual_mask.shape != input_ids.shape
+                or visual_mask.device != input_ids.device
+            ):
+                raise ValueError("visual_mask must be bool [N] on the input device")
+            if not isinstance(visual_features, tuple) or len(visual_features) != 2:
+                raise ValueError(
+                    "visual_features must be (main, list[three DeepStack tensors])"
+                )
+            main, deepstack = visual_features
+            if not isinstance(deepstack, list) or len(deepstack) != 3:
+                raise ValueError(
+                    "visual_features requires exactly three DeepStack tensors"
+                )
+            shape = (int(visual_mask.sum()), self.config.text_config.hidden_size)
+            dtype = self.model.language_model.embed_tokens.weight.dtype
+            for feature in (main, *deepstack):
+                if (
+                    not isinstance(feature, torch.Tensor)
+                    or feature.shape != shape
+                    or feature.device != input_ids.device
+                    or feature.dtype != dtype
+                ):
+                    raise ValueError(
+                        "all visual features must match [V, hidden_size], input device and embedding dtype"
+                    )
+        return self.model.language_model(
+            input_ids,
+            positions,
+            visual_features=visual_features,
+            visual_mask=visual_mask,
+        )
+
+    def encode_images(self, pixel_values, grid_thw):
+        return self.model.visual(pixel_values, grid_thw)
 
     def compute_logits(self, hidden_states):
         return self.lm_head(hidden_states)

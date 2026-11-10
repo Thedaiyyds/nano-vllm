@@ -210,20 +210,19 @@ class TextTests(unittest.TestCase):
             actual = layer(torch.zeros(3, 1, dtype=torch.long, device="cuda"), residual)
         self.assertTrue(torch.equal(actual, expected))
 
-    def test_visual_path_is_explicitly_unavailable(self):
+    def test_visual_features_require_paired_mask_before_decoder(self):
         import torch
         from nanovllm.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
         with bf16_cuda():
             model = Qwen3VLForConditionalGeneration(small_config())
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaisesRegex(ValueError, "together"):
             model(
                 torch.ones(1, dtype=torch.long, device="cuda"),
                 torch.zeros(3, 1, dtype=torch.long, device="cuda"),
                 visual_features=(torch.ones(1, 256, device="cuda"), []),
             )
-        with self.assertRaises(NotImplementedError):
-            Qwen3VLForConditionalGeneration(small_config(), text_only=False)
+        self.assertFalse(hasattr(model.model, "visual"))
 
 
 def small_reference(directory):
