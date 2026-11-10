@@ -390,15 +390,16 @@ def test_engine_rejects_orphans_before_queue_or_kv(kind, bad_id, resources):
     assert pool_state(engine.scheduler.block_manager) == before
 
 
-def test_engine_valid_prepared_explicitly_blocked_before_kv(resources):
+def test_engine_valid_prepared_waits_before_kv(resources):
     from nanovllm import SamplingParams
     from tests.test_qwen3_vl_scheduler import pool_state
 
     engine = cpu_engine(*resources)
     before = pool_state(engine.scheduler.block_manager)
-    with pytest.raises(NotImplementedError, match="[Ii]mage|图像"):
-        engine.generate([small_prompt()], SamplingParams(max_tokens=1), use_tqdm=False)
-    assert engine.is_finished()
+    engine.add_request(small_prompt(), SamplingParams(max_tokens=1))
+    assert len(engine.scheduler.waiting) == 1
+    assert not engine.scheduler.waiting[0].block_table
+    assert engine.scheduler.waiting[0].multimodal.pixel_values.device.type == "cpu"
     assert pool_state(engine.scheduler.block_manager) == before
 
 

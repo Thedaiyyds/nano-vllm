@@ -85,16 +85,12 @@ class LLMEngine:
                 self.config.hf_config,
                 max_visual_tokens=self.config.max_visual_tokens,
             )
-            if len(prompt.image_grid_thw):
-                raise NotImplementedError(
-                    "Model image execution is not connected yet (Task13)"
-                )
             multimodal, prompt = prompt, prompt.token_ids
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         if not isinstance(prompt, list) or not prompt:
             raise ValueError("Prompt must contain at least one token")
-        if self.config.is_multimodal:
+        if self.config.is_multimodal and multimodal is None:
             validate_text_tokens(prompt, self.config.hf_config)
         seq = Sequence(prompt, sampling_params, multimodal=multimodal)
         self.scheduler.add(seq)

@@ -10,7 +10,7 @@
 
 **Spec:** [已批准设计](../specs/2026-10-29-qwen3-vl-design.md)。执行者必须同时阅读两份文档。
 
-**Status:** 2026-11-10，Native Task12本地技术验收完成。完整625源tensor实载无skip，HF固定特征/native自编码两组GPU2项通过51.16s，全部计算对照三指标0；完整CPU313、快速CPU31、既有text/vision GPU8通过。独立Review规格/质量PASS，Critical/Important/Minor均0。见[Task12报告](2026-11-10-qwen3-vl-task12-results.md)。未暂存/Commit/Push，不开始Task13；Oracle只读，宽BF16阈值未批准，远程CI未运行。
+**Status:** 2026-11-10，Native Task13a 本地技术验收及独立Review完成。真实Engine/Runner单图完整Prefill、一次native编码、三轴positions/融合hidden/最后logits/28层选定物理KV严格对齐；完整CPU321、quick31、blocked-import31通过。首轮相关GPU21通过/1过渡加载计数失败保留，最小更新后覆盖重跑2通过30.74s，22个相关GPU节点均已覆盖通过；RunnerCPU26通过。独立Review规格/质量PASS，Critical/Important/Minor均0。见[Task13a报告](2026-11-10-qwen3-vl-task13a-results.md)。小预算model512/batch128/V96；未开始Task13b/13c/14，未暂存/Commit/Push。Oracle只读，宽BF16阈值未批准，远程CI未运行。
 
 ## Global Constraints
 
@@ -23,7 +23,7 @@
 - 初期 VL 禁用 prefix cache 的查找和发布，保留语言 paged KV 读写；共享组件保留针对性兼容回归，原 Qwen3-0.6B 仅保留必要加载/生成smoke，不建立全模型数值基线。
 - `enforce_eager=True` 不会自动关闭 torch.compile；正确性基线额外使用 `TORCHDYNAMO_DISABLE=1`，编译优化另行验收。
 - 16GB 下 HF 与 nano-vLLM 分进程顺序运行，参考张量落 CPU；所有 GPU 测试串行执行。
-- 当前执行授权为Native Task12；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
+- 当前执行授权为Native Task13a；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
 
 ## Review Focus
 
@@ -114,7 +114,7 @@ uv用于指定解释器下的工具安装/包清单；测试用`.venv/bin/python
 
 ### 测试命令、TDD与证据
 
-以下为执行命令约定；当前执行范围为Task12，工具安装单独批准，Task13及以后命令不执行。仓库根目录：
+以下为执行命令约定；当前执行范围为Task13a，工具安装单独批准，Task13b及以后命令不执行。仓库根目录：
 
 ```bash
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TORCHDYNAMO_DISABLE=1
@@ -679,8 +679,8 @@ assert_aligned("image_prefill_logits", actual_logits, hf_logits, tolerances)
 
 **Interfaces：** 消费Prepared CPU状态；产出positions[3,L]、视觉features和完整模型最后logits；使用明确小输入预算。
 
-- [ ] **1. Collection前置检查**：`.venv/bin/python -m pytest tests/test_qwen3_vl_prefill.py --collect-only -q`，节点包含`PrefillRoutingTests`；缺模块先补可导入接口并重试，不计red。
-- [ ] **2. 行为red**：运行`.venv/bin/python -m pytest tests/test_qwen3_vl_prefill.py::PrefillRoutingTests -m gpu --require-gpu -q`，测试断言：
+- [x] **1. Collection前置检查**：`.venv/bin/python -m pytest tests/test_qwen3_vl_prefill.py --collect-only -q`，节点包含`PrefillRoutingTests`；缺模块先补可导入接口并重试，不计red。
+- [x] **2. 行为red**：运行`.venv/bin/python -m pytest tests/test_qwen3_vl_prefill.py::PrefillRoutingTests -m gpu --require-gpu -q`，测试断言：
 
 ```python
 self.assertEqual(vision_forward_spy.call_count, 1)
@@ -688,8 +688,10 @@ assert_aligned("image_prefill_logits", actual_logits, hf_logits, tolerances)
 ```
 
 记录到达的断言和不匹配值；不是setup/import错误。
-- [ ] **3. 最小实现**：只在准入后搬pixels；完整模型text_only=False；拒绝chunk输入；对照融合hidden和28层选定KV。
-- [ ] **4. Green/完成条件**：重跑上述命令并跑本父任务已完成子模块回归；小图完整引擎Prefill真实对齐，非法输入不调用encoder；暂不宣称最大显存范围已通过。保存JUnit/数值报告，进入所属里程碑质量门禁，不自动commit。
+- [x] **3. 最小实现**：只在准入后搬pixels；完整模型text_only=False；拒绝chunk输入；对照融合hidden和28层选定KV。
+- [x] **4. Green/完成条件**：重跑上述命令并跑本父任务已完成子模块回归；小图完整引擎Prefill真实对齐，非法输入不调用encoder；暂不宣称最大显存范围已通过。保存JUnit/数值报告，进入所属里程碑质量门禁，不自动commit。
+
+**2026-11-10 执行结果：** 小预算真实Engine/Runner图像Prefill完成，625源tensor实载无skip，三图各encoder1次；positions/fused/前三层注入后hidden/norm/最后logits/28层选定物理KV共24对与独立HF严格相等。非identity物理block及sentinel验证通过，非法输入/chunk/未准入无encoder或KV副作用；图像Decode明确拒绝。完整CPU321/quick31/blocked-import31通过，相关GPU首轮21通过1旧计数失败，最小更新后覆盖2通过30.74s，RunnerCPU26通过2.21s。三项受控位置/融合/KV映射错误均实际数值失败。独立Review规格/质量PASS，Critical0/Important0/Minor0，root与reviewer分别复算最终24对tensor；Oracle141文件SHA不变。见[Task13a报告](2026-11-10-qwen3-vl-task13a-results.md)。未开始13b/13c/14，无Stage/Commit/Push。
 
 ### Task 13b：联合profile和KV分配预算
 

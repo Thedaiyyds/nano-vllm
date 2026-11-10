@@ -70,10 +70,10 @@ class ModelRunner:
         try:
             if config.hf_config.model_type == "qwen3_vl":
                 self.model = Qwen3VLForConditionalGeneration(
-                    config.hf_config, text_only=True
+                    config.hf_config, text_only=False
                 )
                 self.weight_load_report = load_qwen3_vl_weights(
-                    self.model, config.model, text_only=True
+                    self.model, config.model
                 )
             else:
                 self.model = Qwen3ForCausalLM(config.hf_config)
@@ -319,6 +319,12 @@ class ModelRunner:
                 for seq in seqs
             ):
                 raise ValueError("VL Prefill requires one complete, uncached sequence")
+            if (
+                seqs[0].multimodal is not None
+                and len(seqs[0].multimodal.image_grid_thw)
+                and not seqs[0].block_table
+            ):
+                raise ValueError("Image Prefill requires an admitted request")
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -362,7 +368,14 @@ class ModelRunner:
             non_blocking=True
         )
         if self.config.is_multimodal:
-            positions = positions.unsqueeze(0).expand(3, -1)
+            prompt_positions = seqs[0].prompt_positions
+            positions = (
+                prompt_positions[:, : seqs[0].num_scheduled_tokens].to(
+                    input_ids.device, non_blocking=True
+                )
+                if prompt_positions is not None
+                else positions.unsqueeze(0).expand(3, -1)
+            )
         cu_seqlens_q = torch.tensor(
             cu_seqlens_q, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
@@ -430,10 +443,25 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(
-        self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        is_prefill: bool,
+        *,
+        visual_features=None,
+        visual_mask=None,
     ):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
+            if visual_features is not None or visual_mask is not None:
+                hidden = self.model(
+                    input_ids,
+                    positions,
+                    visual_features=visual_features,
+                    visual_mask=visual_mask,
+                )
+            else:
+                hidden = self.model(input_ids, positions)
+            return self.model.compute_logits(hidden)
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -451,13 +479,41 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
+    @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         try:
+            image_seqs = [
+                seq
+                for seq in seqs
+                if self.config.is_multimodal
+                and seq.multimodal is not None
+                and len(seq.multimodal.image_grid_thw)
+            ]
+            if image_seqs:
+                if not is_prefill:
+                    raise NotImplementedError("Image Decode is deferred until Task14")
             input_ids, positions = (
                 self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
             )
             temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-            logits = self.run_model(input_ids, positions, is_prefill)
+            if image_seqs:
+                seq = image_seqs[0]
+                pixels = seq.multimodal.pixel_values.to(
+                    device=input_ids.device, dtype=self.config.model_dtype
+                )
+                features = self.model.encode_images(
+                    pixels, seq.multimodal.image_grid_thw
+                )
+                mask = seq.visual_mask.to(input_ids.device)
+                logits = self.run_model(
+                    input_ids,
+                    positions,
+                    is_prefill,
+                    visual_features=features,
+                    visual_mask=mask,
+                )
+            else:
+                logits = self.run_model(input_ids, positions, is_prefill)
             return (
                 self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
             )

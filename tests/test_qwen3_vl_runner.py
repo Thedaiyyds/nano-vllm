@@ -187,7 +187,10 @@ def tiny_model_checkpoint(directory, *, multimodal):
     import torch
     from safetensors.torch import save_file
     from transformers import Qwen3Config, Qwen3ForCausalLM, Qwen3VLConfig
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+        Qwen3VLTextModel,
+        Qwen3VLVisionModel,
+    )
     from nanovllm.config import Config
 
     text = dict(
@@ -206,7 +209,19 @@ def tiny_model_checkpoint(directory, *, multimodal):
         text["rope_scaling"] = dict(
             rope_type="default", mrope_interleaved=True, mrope_section=[24, 20, 20]
         )
-        config = Qwen3VLConfig(text_config=text, tie_word_embeddings=True)
+        config = Qwen3VLConfig(
+            text_config=text,
+            tie_word_embeddings=True,
+            vision_config=dict(
+                depth=3,
+                hidden_size=32,
+                intermediate_size=64,
+                num_heads=4,
+                out_hidden_size=256,
+                num_position_embeddings=16,
+                deepstack_visual_indexes=[0, 1, 2],
+            ),
+        )
     else:
         config = Qwen3Config(**text)
     with torch.random.fork_rng(devices=[]):
@@ -221,7 +236,15 @@ def tiny_model_checkpoint(directory, *, multimodal):
         for key, value in hf_model.state_dict().items()
     }
     if multimodal:
-        state["model.visual.patch_embed.proj.weight"] = torch.ones(1)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(2026)
+            vision = Qwen3VLVisionModel(config.vision_config)
+        state.update(
+            {
+                "model.visual." + key: value.detach().clone()
+                for key, value in vision.state_dict().items()
+            }
+        )
     config.save_pretrained(directory)
     save_file(state, str(directory / "model.safetensors"))
     return Config(
@@ -249,7 +272,13 @@ class ModelSelectionTests(unittest.TestCase):
         self.assertTrue(
             all(p.dtype == torch.bfloat16 for p in runner.model.parameters())
         )
-        self.assertFalse(hasattr(runner.model.model, "visual"))
+        self.assertTrue(hasattr(runner.model.model, "visual"))
+        self.assertTrue(
+            torch.equal(
+                runner.model.model.visual.patch_embed.proj.weight,
+                state["model.visual.patch_embed.proj.weight"].bfloat16(),
+            )
+        )
         text = runner.model.model.language_model
         self.assertIs(runner.model.lm_head.weight, text.embed_tokens.weight)
         self.assertTrue(
@@ -268,11 +297,11 @@ class ModelSelectionTests(unittest.TestCase):
         )
         self.assertEqual(
             set(runner.weight_load_report.loaded_keys),
-            set(state) - {"model.visual.patch_embed.proj.weight"},
+            set(state),
         )
         self.assertEqual(
             runner.weight_load_report.skipped_keys,
-            ["model.visual.patch_embed.proj.weight"],
+            [],
         )
         self.assertEqual(runner.weight_load_report.tied_aliases, ["lm_head.weight"])
 
@@ -501,7 +530,7 @@ class PrefillRunnerTests(unittest.TestCase):
         self.assertEqual(
             report["warmup"], [{"tokens": 4096, "positions_shape": [3, 4096]}]
         )
-        self.assertEqual((report["loaded_keys"], report["skipped_keys"]), (310, 315))
+        self.assertEqual((report["loaded_keys"], report["skipped_keys"]), (625, 0))
         identity = json.loads((directory / "hf-identity.json").read_text())
         self.assertEqual(identity["backend"], "flash_attention_2")
         self.assertEqual(identity["gpu"], report["gpu"])
