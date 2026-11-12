@@ -47,7 +47,9 @@ def select_kv_block_count(config: Config, available_bytes: int) -> int:
         if type(value) is not int or value <= 0:
             raise ValueError(f"{name} must be a positive integer, got {value!r}")
     if type(available_bytes) is not int or available_bytes < 0:
-        raise ValueError("available_bytes must be a nonnegative integer net KV budget")
+        raise ValueError(
+            f"available_bytes must be a nonnegative integer net KV budget, got {available_bytes!r}"
+        )
     num_blocks = (
         config.max_model_len + config.kvcache_block_size - 1
     ) // config.kvcache_block_size
@@ -200,6 +202,9 @@ class ModelRunner:
         return method(*args)
 
     def warmup_model(self):
+        if self.config.is_multimodal and not hasattr(self, "kv_cache"):
+            self.vl_memory_profile = self.profile_vl_memory()
+            return
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = (
@@ -216,6 +221,155 @@ class ModelRunner:
             seq.num_scheduled_tokens = seq_len
         self.run(seqs, True)
         torch.cuda.empty_cache()
+
+    def _vl_memory_grids(self):
+        """Largest admissible square and both extreme Prepared grid directions."""
+        config = self.config
+        hf = config.hf_config
+        length = min(config.max_model_len, config.max_num_batched_tokens)
+        # Small test checkpoints may have reserved IDs outside their vocabulary;
+        # they have no admissible image input. Do not bypass public validation.
+        if any(
+            not 0 <= token < hf.text_config.vocab_size
+            for token in (
+                hf.image_token_id,
+                hf.vision_start_token_id,
+                hf.vision_end_token_id,
+            )
+        ):
+            return []
+        visual = min(config.max_visual_tokens, length - 2)
+        if visual < 1:
+            return []
+        side = int(visual**0.5)
+        # Prepared permits merge-divisible extreme shapes beyond the natural
+        # image Processor's smart_resize aspect bound; cover that wider contract.
+        return [(2 * side, 2 * side), (2, 2 * visual), (2 * visual, 2)]
+
+    @torch.inference_mode()
+    def _run_vl_memory_case(self, grid):
+        """Internal resource forward: validated inputs without request admission.
+
+        Before allocation there is intentionally no KV. After allocation the
+        same full Prefill writes real slots. No returned tensors can survive to
+        the caller's current-allocation measurement.
+        """
+        from nanovllm.layers.mrope import build_mrope_positions
+        from nanovllm.utils.multimodal import (
+            PreparedMultimodalPrompt,
+            validate_multimodal,
+            validate_text_tokens,
+        )
+
+        config = self.config
+        hf = config.hf_config
+        length = min(config.max_model_len, config.max_num_batched_tokens)
+        reserved = {
+            hf.image_token_id,
+            hf.video_token_id,
+            hf.vision_start_token_id,
+            hf.vision_end_token_id,
+        }
+        text_id = next(i for i in range(hf.text_config.vocab_size) if i not in reserved)
+        tokens = [text_id] * length
+        features = mask = None
+        try:
+            if grid is None:
+                # Full context is conservative for eventual text Decode even
+                # when admission limits individual Prefill to fewer tokens.
+                tokens = [text_id] * config.max_model_len
+                validate_text_tokens(tokens, hf)
+                seq = Sequence(tokens)
+                seq.num_scheduled_tokens = len(tokens)
+                if hasattr(self, "kv_cache"):
+                    seq.block_table = list(range(config.num_kvcache_blocks))
+                self.run([seq], True)
+                return
+            else:
+                h, w = grid
+                visual = h * w // 4
+                if visual + 2 > length:
+                    raise ValueError("profile image exceeds admissible language length")
+                tokens[: visual + 2] = (
+                    [hf.vision_start_token_id]
+                    + [hf.image_token_id] * visual
+                    + [hf.vision_end_token_id]
+                )
+                vision = hf.vision_config
+                width = (
+                    vision.in_channels
+                    * vision.temporal_patch_size
+                    * vision.patch_size**2
+                )
+                pixels = torch.zeros(
+                    (h * w, width), dtype=config.model_dtype, device="cpu"
+                )
+                grid_tensor = torch.tensor([[1, h, w]], dtype=torch.int64, device="cpu")
+                types = torch.tensor(
+                    [int(t == hf.image_token_id) for t in tokens], device="cpu"
+                )
+                prepared = PreparedMultimodalPrompt(tokens, pixels, grid_tensor, types)
+                validate_multimodal(
+                    prepared, hf, max_visual_tokens=config.max_visual_tokens
+                )
+                positions, _ = build_mrope_positions(tokens, types, grid_tensor, 2)
+                positions = positions.to("cuda")
+                pixels = pixels.to("cuda")
+                features = self.model.encode_images(pixels, grid_tensor)
+                mask = types.to(device="cuda", dtype=torch.bool)
+            input_ids = torch.tensor(tokens, dtype=torch.int64, device="cuda")
+            cu = torch.tensor([0, length], dtype=torch.int32, device="cuda")
+            slots = (
+                torch.arange(length, dtype=torch.int32, device="cuda")
+                if hasattr(self, "kv_cache")
+                else torch.empty(0, dtype=torch.int32, device="cuda")
+            )
+            set_context(True, cu, cu, length, length, slots)
+            self.run_model(
+                input_ids, positions, True, visual_features=features, visual_mask=mask
+            )
+        finally:
+            reset_context()
+
+    def profile_vl_memory(self) -> dict[str, int]:
+        """Joint text/vision activation peak before KV allocation, in bytes."""
+        if hasattr(self, "kv_cache"):
+            raise ValueError("VL memory profile must precede KV allocation")
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        grids = self._vl_memory_grids()
+        for grid in [None, *grids]:
+            self._run_vl_memory_case(grid)
+        # The resource forward stack (including logits/features/pixels) has
+        # ended before measuring current; live outputs cannot cancel reserve.
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        stats = torch.cuda.memory_stats()
+        free, total = torch.cuda.mem_get_info()
+        peak = stats["allocated_bytes.all.peak"]
+        current = stats["allocated_bytes.all.current"]
+        activation = peak - current
+        reserve = self.config.kv_cache_reserve_bytes
+        available = (
+            int(total * self.config.gpu_memory_utilization)
+            - (total - free)
+            - activation
+            - reserve
+        )
+        return dict(
+            peak_allocated=peak,
+            peak_reserved=stats["reserved_bytes.all.peak"],
+            free_after=free,
+            reserve_bytes=reserve,
+            current_allocated=current,
+            activation_bytes=activation,
+            available_bytes=available,
+            total_bytes=total,
+            image_case_count=len(grids),
+        )
 
     def allocate_kv_cache(self):
         config = self.config
@@ -273,20 +427,18 @@ class ModelRunner:
             raise ValueError(
                 f"VL language Attention count {len(attentions)} != {text.num_hidden_layers}"
             )
+        if not hasattr(self, "vl_memory_profile"):
+            self.vl_memory_profile = self.profile_vl_memory()
         free, total = torch.cuda.mem_get_info()
-        stats = torch.cuda.memory_stats()
-        # Subtract the profile increment and explicit reserve once; the helper
-        # consumes this net budget, not the whole device's available memory.
+        # Refresh free/config reserve (also on explicit reallocation), while
+        # reusing the measured activation increment, never a stale net budget.
         available = (
-            int(
-                total * config.gpu_memory_utilization
-                - (total - free)
-                - stats["allocated_bytes.all.peak"]
-                + stats["allocated_bytes.all.current"]
-            )
+            int(total * config.gpu_memory_utilization)
+            - (total - free)
+            - self.vl_memory_profile["activation_bytes"]
             - config.kv_cache_reserve_bytes
         )
-        num_blocks = select_kv_block_count(config, max(available, 0))
+        num_blocks = select_kv_block_count(config, available)
         self.kv_cache = torch.empty(
             2,
             text.num_hidden_layers,

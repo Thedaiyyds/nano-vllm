@@ -10,7 +10,7 @@
 
 **Spec:** [已批准设计](../specs/2026-10-29-qwen3-vl-design.md)。执行者必须同时阅读两份文档。
 
-**Status:** 2026-11-10，Native Task13a 本地技术验收及独立Review完成。真实Engine/Runner单图完整Prefill、一次native编码、三轴positions/融合hidden/最后logits/28层选定物理KV严格对齐；完整CPU321、quick31、blocked-import31通过。首轮相关GPU21通过/1过渡加载计数失败保留，最小更新后覆盖重跑2通过30.74s，22个相关GPU节点均已覆盖通过；RunnerCPU26通过。独立Review规格/质量PASS，Critical/Important/Minor均0。见[Task13a报告](2026-11-10-qwen3-vl-task13a-results.md)。小预算model512/batch128/V96；未开始Task13b/13c/14，未暂存/Commit/Push。Oracle只读，宽BF16阈值未批准，远程CI未运行。
+**Status:** 2026-11-10，Native Task13b 本地技术验收及独立Review完成。联合profile覆盖L4096文本与P1024/V256方图、两极端Prepared网格，清临时输出后计净预算，分配默认16块；负/不足预算拒绝并给数值。最终CPU324通过13.69s，相关GPU13通过110.60s，最终排版来源资源GPU1通过25.86s，quick31/blocked-import31通过。预KV峰allocated4,542,145,024B/reserved4,747,952,128B；已KV峰5,011,923,456B/5,200,936,960B，最小余量10,561,957,376B>1GiB。独立Review I1已修复复审Approved，Critical0/Important0，Minor1诊断harness warning延期记录。见[Task13b报告](2026-11-10-qwen3-vl-task13b-results.md)。未开始Task13c/14，未暂存/Commit/Push；正式Oracle未改，远程CI未运行。
 
 ## Global Constraints
 
@@ -23,7 +23,7 @@
 - 初期 VL 禁用 prefix cache 的查找和发布，保留语言 paged KV 读写；共享组件保留针对性兼容回归，原 Qwen3-0.6B 仅保留必要加载/生成smoke，不建立全模型数值基线。
 - `enforce_eager=True` 不会自动关闭 torch.compile；正确性基线额外使用 `TORCHDYNAMO_DISABLE=1`，编译优化另行验收。
 - 16GB 下 HF 与 nano-vLLM 分进程顺序运行，参考张量落 CPU；所有 GPU 测试串行执行。
-- 当前执行授权为Native Task13a；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
+- 当前执行授权为Native Task13b；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
 
 ## Review Focus
 
@@ -114,7 +114,7 @@ uv用于指定解释器下的工具安装/包清单；测试用`.venv/bin/python
 
 ### 测试命令、TDD与证据
 
-以下为执行命令约定；当前执行范围为Task13a，工具安装单独批准，Task13b及以后命令不执行。仓库根目录：
+以下为执行命令约定；当前执行范围为Task13b，工具安装单独批准，Task13c及以后命令不执行。仓库根目录：
 
 ```bash
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TORCHDYNAMO_DISABLE=1
@@ -701,8 +701,8 @@ assert_aligned("image_prefill_logits", actual_logits, hf_logits, tolerances)
 
 **Interfaces：** profile_vl_memory()->dict[str,int]报告peak/free/reserve；select_kv_block_count消费净预算。
 
-- [ ] **1. Collection前置检查**：`.venv/bin/python -m pytest tests/test_qwen3_vl_memory.py --collect-only -q`，节点包含`MemoryTests`；缺模块先补可导入接口并重试，不计red。
-- [ ] **2. 行为red**：运行`.venv/bin/python -m pytest tests/test_qwen3_vl_memory.py::MemoryTests -m gpu --require-gpu -q`，测试断言：
+- [x] **1. Collection前置检查**：`.venv/bin/python -m pytest tests/test_qwen3_vl_memory.py --collect-only -q`，节点包含`MemoryTests`；缺模块先补可导入接口并重试，不计red。
+- [x] **2. 行为red**：运行`.venv/bin/python -m pytest tests/test_qwen3_vl_memory.py::MemoryTests -m gpu --require-gpu -q`，测试断言：
 
 ```python
 self.assertGreaterEqual(measured_free_margin, config.kv_cache_reserve_bytes)
@@ -710,8 +710,12 @@ self.assertEqual(runner.kv_cache.shape[2], (config.max_model_len + 255) // 256)
 ```
 
 记录到达的断言和不匹配值；不是setup/import错误。
-- [ ] **3. 最小实现**：覆盖最大文本/图文及合法极端长宽比；清临时张量再计预算；预KV与分配后峰值分测；负预算/不足预算拒绝。
-- [ ] **4. Green/完成条件**：重跑上述命令并跑本父任务已完成子模块回归；1GiB建议余量是否充分有实测依据；不足不能标成功或静默缩范围，必须报修订请求；不要求额外租卡。保存JUnit/数值报告，进入所属里程碑质量门禁，不自动commit。
+- [x] **3. 最小实现**：覆盖最大文本/图文及合法极端长宽比；清临时张量再计预算；预KV与分配后峰值分测；负预算/不足预算拒绝。
+- [x] **4. Green/完成条件**：重跑上述命令并跑本父任务已完成子模块回归；1GiB建议余量是否充分有实测依据；不足不能标成功或静默缩范围，必须报修订请求；不要求额外租卡。保存JUnit/数值报告，进入所属里程碑质量门禁，不自动commit。
+
+**2026-11-10 执行结果：** 联合profile覆盖完整文本及方图32x32、Prepared极端2x512/512x2（L4096/P1024/V256），预KV和已KV分别测峰。profile临时输出在current采样前释放，allocator按当前free/显式reserve及实测activation计算净预算一次，默认16块；负预算不clamp、异常含实际数值，容量不足不缩范围。最终CPU324通过13.69s、相关GPU13通过110.60s；I1诊断修复后资源GPU1通过27.60s，最终排版来源复跑1通过25.86s，快速/禁止模型栈CI各31通过。实测最小余量10,561,957,376B高于1GiB，未证明更小余量安全。独立Review I1已修复定向复审Approved，无Critical/Important；M1故障诊断harness anyio warning延期，正式GREEN无warning。Oracle141文件SHA不变。详见[Task13b报告](2026-11-10-qwen3-vl-task13b-results.md)。Task13c上限数值验收/Task14图像Decode未开始，无Stage/Commit/Push。
+
+**2026-11-12 M1 专项：** 诊断 harness 提前导入 anyio 的时序问题已局部修复，RED→GREEN及严格Warning验证通过；host完整CPU324、正式GPU显存1通过，GPU故障仍命中预期断言。独立专项Review Approved，C0/I0/M0，M1 closed；详见[专项报告](2026-11-12-qwen3-vl-task13b-m1-results.md)。不改变生产计算/Oracle/阈值，无Commit/Push。
 
 ### Task 13c：上限Prefill及完整模型文本回归
 
