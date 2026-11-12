@@ -107,3 +107,21 @@ Task1b技术工作完成，停止等待验收；未开始Task1c，未自动Commi
 ## Task 1c（单独交付）
 
 Qwen3-VL-2B参考数据、真实Kernel、阈值依据及复现说明见[Task 1c报告](qwen3_vl_reference_results.md)。旧Qwen3-0.6B回归范围未扩大。
+
+## Native Task13c：真实上限 Prefill 与完整模型文本回归
+
+2026-11-12 新增 `PrefillLimitTests`，复用既有 Prefill worker，在两个独立串行进程执行固定 HF 与 native 完整模型。图像以只读 Oracle `image_limit` 的 Processor 输出为基础，追加确定的文本 token 9707 至 L4095，保持 `[1,32,32]`、P1024/V256；纯文本输入为4095个9707。两例都经真实 `LLMEngine.add_request/step`，max_tokens=1、TP1、BF16、视觉SDPA/语言FA2、eager并关闭torch.compile。HF自行调用 `get_rope_index`，仅投影最后位置的 logits。
+
+每例严格比较 FP32 的28层文字频率、positions、完整融合 embedding、前三层注入后 hidden、最终 norm、最后 logits，以及28层选定物理 KV，共9对张量；沿用Task13a三个误差指标全部0的阈值。KV检查含255/256/257及511/512页界、视觉首尾、最后位置，使用非identity物理块顺序和未使用slot sentinel。V257与图文/文本总预算超限须在请求KV分配或encoder调用前拒绝，队列/块池和真实GPU KV保持不变。
+
+首轮真实边界测试发现 CUDA 默认设备构造文字频率与 HF 的CPU初始化有4项FP32 ULP差异；修复仅在Runner加载完整VL时用既有native helper在CPU产生常量并复制至28层，不改变权重、MRoPE公式、attention后端或阈值。最终完整CPU324 passed10.34s、相关GPU18 passed149.23s，两例18对HF张量三项指标全部0；已KV图像/文本allocated峰分别5,011,924,480/5,007,656,448B，reserved均5,200,936,960B，最小保守free margin10,256,820,736B。4项位置/融合/物理slot/准入受控故障均命中预期断言，正式Oracle141文件SHA不变。完整回归、资源数值、真实RED和受控故障、复现命令与Review状态见[Task13c报告](../docs/superpowers/plans/2026-11-12-qwen3-vl-task13c-results.md)。本项只覆盖首个next-token，图像Decode仍由原Task14 guard明确拒绝。
+
+独立Review规格PASS、质量Approved，Critical0/Important0/Minor0；Reviewer独立复算最终18对张量并核对原始日志、JUnit、身份及来源SHA，无待修复/延期项。Task13c完成，Task14未开始；本增量门槛不替代整分支其他全局限制的已有验证。最终5文件diff、来源/张量/Review绑定见本轮证据目录 `task13c/final-deliverables.diff` 与 `final-manifest.json`。
+
+```bash
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TORCHDYNAMO_DISABLE=1
+.venv/bin/python -m pytest tests/test_qwen3_vl_prefill.py --collect-only -q
+.venv/bin/python -m pytest tests/test_qwen3_vl_prefill.py::PrefillLimitTests -m gpu --require-gpu -q
+.venv/bin/python -m pytest tests -m 'not gpu' -q
+.venv/bin/python -m pytest tests/test_qwen3_vl_memory.py tests/test_qwen3_vl_prefill.py tests/test_qwen3_vl_runner.py tests/test_qwen3_vl_text.py tests/test_original_baseline.py -m gpu --require-gpu -q
+```

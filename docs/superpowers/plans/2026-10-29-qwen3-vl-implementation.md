@@ -10,7 +10,7 @@
 
 **Spec:** [已批准设计](../specs/2026-10-29-qwen3-vl-design.md)。执行者必须同时阅读两份文档。
 
-**Status:** 2026-11-10，Native Task13b 本地技术验收及独立Review完成。联合profile覆盖L4096文本与P1024/V256方图、两极端Prepared网格，清临时输出后计净预算，分配默认16块；负/不足预算拒绝并给数值。最终CPU324通过13.69s，相关GPU13通过110.60s，最终排版来源资源GPU1通过25.86s，quick31/blocked-import31通过。预KV峰allocated4,542,145,024B/reserved4,747,952,128B；已KV峰5,011,923,456B/5,200,936,960B，最小余量10,561,957,376B>1GiB。独立Review I1已修复复审Approved，Critical0/Important0，Minor1诊断harness warning延期记录。见[Task13b报告](2026-11-10-qwen3-vl-task13b-results.md)。未开始Task13c/14，未暂存/Commit/Push；正式Oracle未改，远程CI未运行。
+**Status:** 2026-11-12，Native Task13c 本地技术验收及独立Review完成。真实Engine图像V256/L4095/max_tokens1与完整模型纯文本4095请求，对照独立HF的positions/频率/fused/前三层hidden/norm/最后logits/28层选定物理KV，两例18对严格相等；V257和3类总预算超限在请求块分配/encoder前拒绝。初次GPU有效数值RED定位CPU/CUDA初始化4个FP32频率差异，必要Runner8行修复，不改权重/后端/阈值。最终CPU324通过10.34s、相关GPU18通过149.23s、quick31/blocked31通过，4项受控错误有效；图像/文本allocated峰5,011,924,480/5,007,656,448B，reserved5,200,936,960B，最小余量10,256,820,736B。独立Review规格/质量PASS，Critical/Important/Minor均0。见[Task13c报告](2026-11-12-qwen3-vl-task13c-results.md)。未开始Task14、未暂存/Commit/Push；Oracle141文件未改，远程CI未运行。
 
 ## Global Constraints
 
@@ -23,7 +23,7 @@
 - 初期 VL 禁用 prefix cache 的查找和发布，保留语言 paged KV 读写；共享组件保留针对性兼容回归，原 Qwen3-0.6B 仅保留必要加载/生成smoke，不建立全模型数值基线。
 - `enforce_eager=True` 不会自动关闭 torch.compile；正确性基线额外使用 `TORCHDYNAMO_DISABLE=1`，编译优化另行验收。
 - 16GB 下 HF 与 nano-vLLM 分进程顺序运行，参考张量落 CPU；所有 GPU 测试串行执行。
-- 当前执行授权为Native Task13b；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
+- 当前执行授权为Native Task13c；新工具安装须先展示dry-run并获用户批准；不推进后续任务、不自动提交或推送。每任务保留验证记录；每个里程碑经过独立 Review 后，提交具体 diff 和拟提交文件清单，请用户人工批准 Commit，未获批准不得暂存、提交或推送。
 
 ## Review Focus
 
@@ -114,7 +114,7 @@ uv用于指定解释器下的工具安装/包清单；测试用`.venv/bin/python
 
 ### 测试命令、TDD与证据
 
-以下为执行命令约定；当前执行范围为Task13b，工具安装单独批准，Task13c及以后命令不执行。仓库根目录：
+以下为执行命令约定；当前执行范围为Task13c，工具安装单独批准，Task14及以后命令不执行。仓库根目录：
 
 ```bash
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TORCHDYNAMO_DISABLE=1
@@ -725,8 +725,8 @@ self.assertEqual(runner.kv_cache.shape[2], (config.max_model_len + 255) // 256)
 
 **Interfaces：** 消费联合profile和完整模型；产出4096总预算/256视觉token边界证据。
 
-- [ ] **1. Collection前置检查**：`.venv/bin/python -m pytest tests/test_qwen3_vl_prefill.py --collect-only -q`，节点包含`PrefillLimitTests`；缺模块先补可导入接口并重试，不计red。
-- [ ] **2. 行为red**：运行`.venv/bin/python -m pytest tests/test_qwen3_vl_prefill.py::PrefillLimitTests -m gpu --require-gpu -q`，测试断言：
+- [x] **1. Collection前置检查**：`.venv/bin/python -m pytest tests/test_qwen3_vl_prefill.py --collect-only -q`，节点包含`PrefillLimitTests`；缺模块先补可导入接口并重试，不计red。
+- [x] **2. 行为red**：运行`.venv/bin/python -m pytest tests/test_qwen3_vl_prefill.py::PrefillLimitTests -m gpu --require-gpu -q`，测试断言：
 
 ```python
 self.assertEqual(accepted_visual_tokens, 256)
@@ -735,9 +735,11 @@ assert_aligned("complete_model_text_logits", actual_text_logits, hf_text_logits,
 ```
 
 记录到达的断言和不匹配值；不是setup/import错误。
-- [ ] **3. 最小实现**：构造L=4095/max_new_tokens=1的真实请求；profile内部可独立用4096 token不采样；V256成功/V超256拒绝；重跑P1。
-- [ ] **4. Green/完成条件**：重跑上述命令并跑本父任务已完成子模块回归；验证分配后的峰值和最后logits/KV；仅大输入做OOM测试但不测数值不能过门槛。保存JUnit/数值报告，进入所属里程碑质量门禁，不自动commit。
+- [x] **3. 最小实现**：构造L=4095/max_new_tokens=1的真实请求；profile内部可独立用4096 token不采样；V256成功/V超256拒绝；重跑P1。
+- [x] **4. Green/完成条件**：重跑上述命令并跑本父任务已完成子模块回归；验证分配后的峰值和最后logits/KV；仅大输入做OOM测试但不测数值不能过门槛。保存JUnit/数值报告，进入所属里程碑质量门禁，不自动commit。
 
+
+**2026-11-12 执行结果：** 真实图文V256与完整模型纯文本各L4095/max_tokens1，经Engine+Scheduler+Runner接受；V257完整结构及三类总长度超限在请求block分配/encoder前拒绝，KV不变。独立HF/native分进程，两例含频率/positions/fused/前三层hidden/norm/最后logits/28层物理KV共18对严格相等，非identity16页及未用slot sentinel、实际采样argmax通过。首次数值RED发现GPU/CPU默认设备生成FP32 inv_freq四lane差异；最小Runner CPU常量初始化8行修复，未改shared层/权重/阈值。最终CPU324通过10.34s、GPU18通过149.23s、quick/blocked各31通过，4fault有效；最终已KV两例allocated峰5,011,924,480/5,007,656,448B、reserved5,200,936,960B，minmargin10,256,820,736B。独立Review规格/质量PASS，Critical0/Important0/Minor0；root与reviewer分别复算18对tensor与源码绑定，Oracle141文件SHA不变。详见[Task13c报告](2026-11-12-qwen3-vl-task13c-results.md)。P2c完整Prefill门禁完成，Task14图像Decode未开始，无Stage/Commit/Push。
 
 ## Task 14：单图 Decode、异常释放与连续请求
 

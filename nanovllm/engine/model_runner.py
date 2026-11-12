@@ -74,6 +74,14 @@ class ModelRunner:
                 self.model = Qwen3VLForConditionalGeneration(
                     config.hf_config, text_only=False
                 )
+                # HF initializes non-weight text frequencies on CPU before moving
+                # them to CUDA. GPU pow differs by FP32 ULPs that affect long RoPE.
+                from nanovllm.layers.mrope import Qwen3VLRotaryEmbedding
+
+                with torch.device("cpu"):
+                    inv_freq = Qwen3VLRotaryEmbedding(config.text_config).inv_freq
+                for layer in self.model.model.language_model.layers:
+                    layer.self_attn.rotary_emb.inv_freq.copy_(inv_freq)
                 self.weight_load_report = load_qwen3_vl_weights(
                     self.model, config.model
                 )
